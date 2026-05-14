@@ -125,6 +125,7 @@ processor = AutoProcessor.from_pretrained(MODEL_PATH)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_PATH,
     dtype=torch.bfloat16,
+    attn_implementation="eager",  # Force eager attention (not SDPA) for Neuron compatibility
 ).eval().requires_grad_(False)
 
 # ─── Shard LLM decoder layers ──────────────────────────────────────
@@ -177,30 +178,15 @@ if rank == 0:
     print("  Moving sharded model to Neuron...")
 model = model.to(NEURON_DEVICE)
 
-# Compile only the pure Linear layers inside attention and MLP
-# (NOT the full attention module — it has dynamic KV cache ops)
+# PURE EAGER TEST — no torch.compile at all
+# This isolates whether the TP logic itself is correct
 if rank == 0:
-    print("  Compiling Linear layers on Neuron...")
+    print("  [PURE EAGER] Skipping torch.compile — running entirely in eager mode")
 compile_start = time.time()
 
-for layer in lang_model.layers:
-    attn = layer.self_attn
-    # Compile the Linear projections (pure matmul, static shapes)
-    attn.q_proj = torch.compile(attn.q_proj, backend='neuron', dynamic=False)
-    attn.k_proj = torch.compile(attn.k_proj, backend='neuron', dynamic=False)
-    attn.v_proj = torch.compile(attn.v_proj, backend='neuron', dynamic=False)
-    attn.o_proj = torch.compile(attn.o_proj, backend='neuron', dynamic=False)
-
-    mlp = layer.mlp
-    mlp.gate_proj = torch.compile(mlp.gate_proj, backend='neuron', dynamic=False)
-    mlp.up_proj = torch.compile(mlp.up_proj, backend='neuron', dynamic=False)
-    mlp.down_proj = torch.compile(mlp.down_proj, backend='neuron', dynamic=False)
-
-model.lm_head = torch.compile(model.lm_head, backend='neuron', dynamic=False)
-
-# Wrap with TP modules (all_reduce/all_gather in EAGER, outside compiled graph)
+# Wrap with TP modules (all_reduce/all_gather)
 if rank == 0:
-    print("  Wrapping with TP modules (eager all_reduce/all_gather)...")
+    print("  Wrapping with TP modules (all_reduce/all_gather)...")
 
 for layer in lang_model.layers:
     layer.self_attn = TPAttention(layer.self_attn)
