@@ -251,8 +251,70 @@ if rank == 0:
 
 dist.barrier()
 
+# ═══════════════════════════════════════════════════════════════════════
+# WARMUP 2: Video inference (triggers compilation for video seq lengths)
+# ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print("[READY] Model warmed up, starting HTTP server...")
+    print("=" * 60)
+    print("  WARMUP 2: Video Inference (triggers compilation)")
+    print("=" * 60)
+
+VIDEO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-VL/space_woaudio.mp4"
+VIDEO_PATH = "/tmp/sample_video.mp4"
+VIDEO_INPUTS_PATH = "/tmp/video_warmup_inputs.pt"
+
+if rank == 0:
+    print(f"Downloading sample video: {VIDEO_URL}")
+    urllib.request.urlretrieve(VIDEO_URL, VIDEO_PATH)
+    print(f"Video saved to {VIDEO_PATH}")
+
+    from qwen_vl_utils import process_vision_info
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "video", "video": VIDEO_PATH, "nframes": 4},
+                {"type": "text", "text": "Describe what is happening in this video."},
+            ],
+        }
+    ]
+
+    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    vid_inputs = processor(text=[text_prompt], images=image_inputs, videos=video_inputs, return_tensors="pt")
+    torch.save(vid_inputs, VIDEO_INPUTS_PATH)
+    print(f"Video processed and saved for all ranks")
+
+dist.barrier()
+
+vid_inputs = torch.load(VIDEO_INPUTS_PATH, weights_only=False)
+vid_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in vid_inputs.items()}
+
+if rank == 0:
+    print("\n[WARMUP 2] Video inference (includes compilation for video seq length)...")
+    warmup2_start = time.time()
+
+with torch.no_grad():
+    vid_output_ids = model.generate(**vid_inputs, max_new_tokens=128, do_sample=False)
+
+if rank == 0:
+    warmup2_time = time.time() - warmup2_start
+    vid_output_ids_cpu = vid_output_ids.cpu()
+    vid_input_len = vid_inputs["input_ids"].shape[-1]
+    vid_generated = vid_output_ids_cpu[:, vid_input_len:]
+    vid_response = processor.batch_decode(vid_generated, skip_special_tokens=True)[0]
+
+    print(f"\n{'─' * 40}")
+    print(f"VIDEO WARMUP COMPLETE ({warmup2_time:.2f}s):")
+    print(f"{'─' * 40}")
+    print(vid_response[:200])
+    print(f"{'─' * 40}\n")
+
+dist.barrier()
+
+if rank == 0:
+    print("[READY] Model warmed up (image + video), starting HTTP server...")
 
 # ═══════════════════════════════════════════════════════════════════════
 # SERVING: FastAPI on rank 0, all ranks participate in generate
@@ -333,6 +395,9 @@ if rank == 0:
                             if item.get("type") == "image_url":
                                 url = item.get("image_url", {}).get("url", "")
                                 content_items.append({"type": "image", "image": url})
+                            elif item.get("type") == "video_url":
+                                url = item.get("video_url", {}).get("url", "")
+                                content_items.append({"type": "video", "video": url})
                             elif item.get("type") in ("image", "video", "text"):
                                 content_items.append(item)
                             else:
