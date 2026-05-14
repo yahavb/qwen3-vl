@@ -177,16 +177,26 @@ if rank == 0:
     print("  Moving sharded model to Neuron...")
 model = model.to(NEURON_DEVICE)
 
-# Wrap with TP modules (all_reduce/all_gather inside forward)
+# Step 1: Compile raw inner modules on Neuron (pure compute, no collectives)
 if rank == 0:
-    print("  Wrapping layers with TP modules and compiling...")
+    print("  Compiling inner modules on Neuron...")
 compile_start = time.time()
 
 for layer in lang_model.layers:
-    layer.self_attn = torch.compile(TPAttention(layer.self_attn), backend='neuron', dynamic=False)
-    layer.mlp = torch.compile(TPMLP(layer.mlp), backend='neuron', dynamic=False)
+    layer.self_attn = torch.compile(layer.self_attn, backend='neuron', dynamic=False)
+    layer.mlp = torch.compile(layer.mlp, backend='neuron', dynamic=False)
 
-model.lm_head = torch.compile(TPLMHead(model.lm_head, TP), backend='neuron', dynamic=False)
+model.lm_head = torch.compile(model.lm_head, backend='neuron', dynamic=False)
+
+# Step 2: Wrap with TP modules (all_reduce/all_gather in EAGER, outside compiled graph)
+if rank == 0:
+    print("  Wrapping with TP modules (eager all_reduce/all_gather)...")
+
+for layer in lang_model.layers:
+    layer.self_attn = TPAttention(layer.self_attn)
+    layer.mlp = TPMLP(layer.mlp)
+
+model.lm_head = TPLMHead(model.lm_head, TP)
 
 compile_time = time.time() - compile_start
 if rank == 0:
