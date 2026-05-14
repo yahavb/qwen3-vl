@@ -177,18 +177,28 @@ if rank == 0:
     print("  Moving sharded model to Neuron...")
 model = model.to(NEURON_DEVICE)
 
-# Step 1: Compile raw inner modules on Neuron (pure compute, no collectives)
+# Compile only the pure Linear layers inside attention and MLP
+# (NOT the full attention module — it has dynamic KV cache ops)
 if rank == 0:
-    print("  Compiling inner modules on Neuron...")
+    print("  Compiling Linear layers on Neuron...")
 compile_start = time.time()
 
 for layer in lang_model.layers:
-    layer.self_attn = torch.compile(layer.self_attn, backend='neuron', dynamic=False)
-    layer.mlp = torch.compile(layer.mlp, backend='neuron', dynamic=False)
+    attn = layer.self_attn
+    # Compile the Linear projections (pure matmul, static shapes)
+    attn.q_proj = torch.compile(attn.q_proj, backend='neuron', dynamic=False)
+    attn.k_proj = torch.compile(attn.k_proj, backend='neuron', dynamic=False)
+    attn.v_proj = torch.compile(attn.v_proj, backend='neuron', dynamic=False)
+    attn.o_proj = torch.compile(attn.o_proj, backend='neuron', dynamic=False)
+
+    mlp = layer.mlp
+    mlp.gate_proj = torch.compile(mlp.gate_proj, backend='neuron', dynamic=False)
+    mlp.up_proj = torch.compile(mlp.up_proj, backend='neuron', dynamic=False)
+    mlp.down_proj = torch.compile(mlp.down_proj, backend='neuron', dynamic=False)
 
 model.lm_head = torch.compile(model.lm_head, backend='neuron', dynamic=False)
 
-# Step 2: Wrap with TP modules (all_reduce/all_gather in EAGER, outside compiled graph)
+# Wrap with TP modules (all_reduce/all_gather in EAGER, outside compiled graph)
 if rank == 0:
     print("  Wrapping with TP modules (eager all_reduce/all_gather)...")
 
