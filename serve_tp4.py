@@ -106,11 +106,17 @@ assert TP == 4, f"Expected 4 ranks, got {TP}"
 torch.neuron.set_device(rank)
 NEURON_DEVICE = torch.device("neuron")
 
+# Configurable via env var — controls video memory usage
+MAX_NFRAMES = int(os.environ.get("QWEN3_VL_MAX_NFRAMES", "4"))
+MAX_NEW_TOKENS_DEFAULT = int(os.environ.get("QWEN3_VL_MAX_NEW_TOKENS", "256"))
+
 if rank == 0:
     print("=" * 60)
     print(f"  Qwen3-VL-8B-Instruct TP-4 on PyTorch Native (Neuron)")
     print(f"  torch.compile(backend='neuron') + eager attention")
     print(f"  World size: {TP}")
+    print(f"  MAX_NFRAMES: {MAX_NFRAMES}")
+    print(f"  MAX_NEW_TOKENS: {MAX_NEW_TOKENS_DEFAULT}")
     print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -265,7 +271,7 @@ if rank == 0:
     from qwen_vl_utils import process_vision_info
 
     messages = [{"role": "user", "content": [
-        {"type": "video", "video": VIDEO_PATH, "nframes": 4},
+        {"type": "video", "video": VIDEO_PATH, "nframes": MAX_NFRAMES},
         {"type": "text", "text": "Describe what is happening in this video."},
     ]}]
 
@@ -392,9 +398,9 @@ if rank == 0:
                                     tmp.write(video_bytes)
                                     tmp.close()
                                     print(f"  Decoded video data URI to {tmp.name} ({len(video_bytes)} bytes)")
-                                    content_items.append({"type": "video", "video": tmp.name, "nframes": 4})
+                                    content_items.append({"type": "video", "video": tmp.name, "nframes": MAX_NFRAMES})
                                 else:
-                                    content_items.append({"type": "video", "video": url, "nframes": 4})
+                                    content_items.append({"type": "video", "video": url, "nframes": MAX_NFRAMES})
                             elif item.get("type") in ("image", "video", "text"):
                                 content_items.append(item)
                             else:
