@@ -179,6 +179,9 @@ for layer in lang_model.layers:
         attn.v_proj.bias = nn.Parameter(
             attn.v_proj.bias.data[kv_start:kv_end].contiguous(), requires_grad=False)
 
+    # Update num_key_value_groups for this rank (2 Q heads / 1 KV head = 2)
+    attn.num_key_value_groups = 2
+
     # O: row-parallel (shard input dim by TP=16)
     attn.o_proj.weight = nn.Parameter(
         shard_row(attn.o_proj.weight.data, rank, TP), requires_grad=False)
