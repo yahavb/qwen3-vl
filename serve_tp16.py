@@ -9,10 +9,10 @@ Model dims (Qwen3-VL-8B):
   hidden_size=4096, num_heads=32, num_kv_heads=8, intermediate=12288
   head_dim=128, 36 layers, vocab=151936
 
-TP-16 sharding:
+TP-16 sharding (GQA-aware):
   Q: 32 heads -> 2/rank (256 dim/rank) — column-parallel
-  K: 8 KV heads -> REPLICATED (each rank gets all 8 KV heads)
-  V: 8 KV heads -> REPLICATED (each rank gets all 8 KV heads)
+  K: 8 KV heads -> 1/rank (128 dim/rank) — GQA grouped (rank//2 selects KV head)
+  V: 8 KV heads -> 1/rank (128 dim/rank) — GQA grouped
   O: row-parallel (input dim = 2 heads * 128 = 256/rank)
   gate_proj/up_proj: 12288 -> 768/rank (column)
   down_proj: row-parallel (input 768/rank)
@@ -131,20 +131,31 @@ model = AutoModelForImageTextToText.from_pretrained(
 
 lang_model = model.model.language_model
 
-# ─── TP-16 sharding: Q sharded, K/V replicated ──────────────────
-# Q: 32 heads / 16 = 2 heads/rank (column-parallel)
-# K/V: 8 KV heads — REPLICATED (each rank keeps all 8)
-# O: row-parallel (input = 2*128=256 per rank)
+# ─── TP-16 sharding: Q/K/V all sharded with GQA-aware grouping ──
+# Original: 32 Q heads, 8 KV heads → GQA group_size=4 (4 Q per KV)
+# TP-16: 2 Q heads/rank, 1 KV head/rank
+#   rank 0-1  share KV head 0 (Q heads 0-3 split across 2 ranks)
+#   rank 2-3  share KV head 1 (Q heads 4-7 split across 2 ranks)
+#   ...
+#   rank 14-15 share KV head 7 (Q heads 28-31 split across 2 ranks)
+#
+# Per rank: Q=[256], K=[128], V=[128], O row-parallel input=256
 
-# Config update: Q heads per rank, KV heads stay full
-lang_model.config.num_attention_heads = 32 // TP   # 2 per rank
-lang_model.config.num_key_value_heads = 8          # full (replicated)
+ORIG_NUM_Q_HEADS = 32
+ORIG_NUM_KV_HEADS = 8
+HEAD_DIM = 128
+
+lang_model.config.num_attention_heads = ORIG_NUM_Q_HEADS // TP    # 2 per rank
+lang_model.config.num_key_value_heads = 1                          # 1 KV head per rank
+
+# Which KV head does this rank use?
+kv_head_idx = rank // 2   # ranks 0-1 → KV head 0, ranks 2-3 → KV head 1, ...
 
 for layer in lang_model.layers:
     attn = layer.self_attn
     mlp = layer.mlp
 
-    # Q: column-parallel (shard by TP=16)
+    # Q: column-parallel (shard by TP=16, 2 heads per rank)
     attn.q_proj.weight = nn.Parameter(
         shard_column(attn.q_proj.weight.data, rank, TP), requires_grad=False)
     if attn.q_proj.bias is not None:
@@ -152,8 +163,21 @@ for layer in lang_model.layers:
             shard_column(attn.q_proj.bias.data.unsqueeze(1), rank, TP).squeeze(1),
             requires_grad=False)
 
-    # K: REPLICATED — keep full weights (no sharding)
-    # V: REPLICATED — keep full weights (no sharding)
+    # K: take this rank's KV head (1 head = 128 dims)
+    kv_start = kv_head_idx * HEAD_DIM
+    kv_end = kv_start + HEAD_DIM
+    attn.k_proj.weight = nn.Parameter(
+        attn.k_proj.weight.data[kv_start:kv_end].contiguous(), requires_grad=False)
+    if attn.k_proj.bias is not None:
+        attn.k_proj.bias = nn.Parameter(
+            attn.k_proj.bias.data[kv_start:kv_end].contiguous(), requires_grad=False)
+
+    # V: take this rank's KV head (1 head = 128 dims)
+    attn.v_proj.weight = nn.Parameter(
+        attn.v_proj.weight.data[kv_start:kv_end].contiguous(), requires_grad=False)
+    if attn.v_proj.bias is not None:
+        attn.v_proj.bias = nn.Parameter(
+            attn.v_proj.bias.data[kv_start:kv_end].contiguous(), requires_grad=False)
 
     # O: row-parallel (shard input dim by TP=16)
     attn.o_proj.weight = nn.Parameter(
@@ -176,7 +200,7 @@ model.lm_head.weight = nn.Parameter(
 if rank == 0:
     print(f"  Sharded 36 layers for TP-{TP}:")
     print(f"    Q: 2 heads/rank (column-parallel)")
-    print(f"    K/V: 8 heads/rank (REPLICATED)")
+    print(f"    K/V: 1 head/rank (GQA-grouped, rank//2 selects KV head)")
     print(f"    O: row-parallel (256 input dim/rank)")
     print(f"    MLP: gate/up 768/rank, down row-parallel")
     print(f"    lm_head: {lm_head_chunks} vocab/rank")
