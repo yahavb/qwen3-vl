@@ -403,7 +403,19 @@ if rank == 0:
                                 content_items.append({"type": "image", "image": url})
                             elif item.get("type") == "video_url":
                                 url = item.get("video_url", {}).get("url", "")
-                                content_items.append({"type": "video", "video": url})
+                                if url.startswith("data:video/"):
+                                    # Decode base64 data URI to temp file
+                                    import base64 as b64mod
+                                    import tempfile as tmpmod
+                                    header, b64data = url.split(",", 1)
+                                    video_bytes = b64mod.b64decode(b64data)
+                                    tmp = tmpmod.NamedTemporaryFile(suffix=".mp4", delete=False)
+                                    tmp.write(video_bytes)
+                                    tmp.close()
+                                    print(f"  Decoded video data URI to {tmp.name} ({len(video_bytes)} bytes)")
+                                    content_items.append({"type": "video", "video": tmp.name, "nframes": 4})
+                                else:
+                                    content_items.append({"type": "video", "video": url, "nframes": 4})
                             elif item.get("type") in ("image", "video", "text"):
                                 content_items.append(item)
                             else:
