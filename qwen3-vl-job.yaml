@@ -93,6 +93,8 @@ spec:
               value: "ERROR"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
+            - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
+              value: "0"
             - name: QWEN3_VL_MAX_NFRAMES
               value: "4"
             - name: QWEN3_VL_MAX_NEW_TOKENS
