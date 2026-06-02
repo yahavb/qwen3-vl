@@ -123,16 +123,21 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
     # embed_tokens (replicated)
     embed_tokens = lang_model.embed_tokens
 
-    # Final norm (replicated)
-    final_norm = RMSNorm(
-        lang_model.final_layernorm.weight.data.clone()
-        if hasattr(lang_model, 'final_layernorm')
-        else lang_model.norm.weight.data.clone(),
-        eps=config.rms_norm_eps,
-    )
+    # Final norm (replicated) — HF uses 'norm' or 'final_layernorm'
+    if hasattr(lang_model, 'norm'):
+        final_norm_weight = lang_model.norm.weight.data.clone()
+    elif hasattr(lang_model, 'final_layernorm'):
+        final_norm_weight = lang_model.final_layernorm.weight.data.clone()
+    else:
+        raise AttributeError(f"Cannot find final norm. Attributes: {[n for n in dir(lang_model) if 'norm' in n.lower()]}")
+    final_norm = RMSNorm(final_norm_weight, eps=config.rms_norm_eps)
 
-    # RoPE
-    rotary = RotaryEmbedding(HEAD_DIM, max_seq_len=8192, base=config.rope_theta)
+    # RoPE — rope_theta may be top-level or inside rope_scaling
+    rope_theta = getattr(config, 'rope_theta', None)
+    if rope_theta is None:
+        rope_scaling = getattr(config, 'rope_scaling', {}) or {}
+        rope_theta = rope_scaling.get('rope_theta', 1000000.0)
+    rotary = RotaryEmbedding(HEAD_DIM, max_seq_len=8192, base=rope_theta)
 
     if rank == 0:
         print(f"  Weights fused+sharded: {time.time()-t0:.1f}s")
@@ -179,7 +184,14 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
     )
 
     # Vision encoder: keep on device, no compile (eager)
-    vision_model = hf_model.model.visual.to(device)
+    if hasattr(hf_model.model, 'visual'):
+        vision_model = hf_model.model.visual.to(device)
+    elif hasattr(hf_model.model, 'vision_model'):
+        vision_model = hf_model.model.vision_model.to(device)
+    else:
+        vision_model = None
+        if rank == 0:
+            print("  WARNING: No vision encoder found")
 
     if rank == 0:
         print(f"[READY] Decoder + vision encoder loaded.")
