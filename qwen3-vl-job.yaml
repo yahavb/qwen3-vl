@@ -65,10 +65,10 @@ spec:
 
               echo "Model weights ready at $MODEL_LOCAL"
 
-              # ─── Launch profiler ──────────────────────────────────────────────
+              # ─── Launch TP-8 with fused projections ─────────────────────────
               # s-lnc1-trn2 = 1 Neuron Device, LNC=1, 8 NeuronCores
-              echo "Launching TP-8 profiler..."
-              torchrun --nproc_per_node=8 /tmp/qwen3-vl/profile_tp8.py
+              echo "Launching TP-8 fused+bucketed serving..."
+              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_tp8.py
           resources:
             claims:
               - name: s-lnc1-trn2
