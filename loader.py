@@ -113,6 +113,10 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
             eps=config.rms_norm_eps,
         )
 
+        # Per-head QK RMSNorm weights (Qwen3 applies RMSNorm to Q and K before RoPE)
+        q_norm_w = attn.q_norm.weight.data.clone() if hasattr(attn, 'q_norm') else torch.ones(HEAD_DIM)
+        k_norm_w = attn.k_norm.weight.data.clone() if hasattr(attn, 'k_norm') else torch.ones(HEAD_DIM)
+
         layers.append(DecoderLayer(
             qkv=FusedLinear(qkv_w, qkv_bias),
             o_proj=FusedLinear(o_w),
@@ -120,6 +124,8 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
             down=FusedLinear(down_w),
             input_norm=input_norm,
             post_norm=post_norm,
+            q_norm_weight=q_norm_w,
+            k_norm_weight=k_norm_w,
         ))
 
     # lm_head: column-parallel
@@ -170,6 +176,8 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
         layer.down = _compile(layer.down)
         layer.input_norm = layer.input_norm.to(device)
         layer.post_norm = layer.post_norm.to(device)
+        layer.q_norm_weight = layer.q_norm_weight.to(device)
+        layer.k_norm_weight = layer.k_norm_weight.to(device)
 
     lm_head = _compile(lm_head)
     embed_tokens = embed_tokens.to(device)

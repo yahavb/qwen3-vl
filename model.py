@@ -77,15 +77,24 @@ def apply_rotary(x, cos, sin):
     return x * cos + rotate_half(x) * sin
 
 
+def head_rms_norm(x, weight, eps=1e-6):
+    """Per-head RMSNorm: x is [batch, heads, seq, head_dim], weight is [head_dim]."""
+    x_fp32 = x.float()
+    rms = torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + eps)
+    return (x_fp32 * rms).to(x.dtype) * weight
+
+
 class DecoderLayer:
     """One transformer layer — stores compiled fused modules + eager norms."""
-    def __init__(self, qkv, o_proj, gate_up, down, input_norm, post_norm):
+    def __init__(self, qkv, o_proj, gate_up, down, input_norm, post_norm, q_norm_weight, k_norm_weight):
         self.qkv = qkv
         self.o_proj = o_proj
         self.gate_up = gate_up
         self.down = down
         self.input_norm = input_norm
         self.post_norm = post_norm
+        self.q_norm_weight = q_norm_weight
+        self.k_norm_weight = k_norm_weight
 
 
 class Qwen3VLDecoder:
@@ -146,6 +155,10 @@ class Qwen3VLDecoder:
         q = qkv[..., :self.q_dim].view(bsz, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
         k = qkv[..., self.q_dim:self.q_dim+self.kv_dim].view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         v = qkv[..., self.q_dim+self.kv_dim:].view(bsz, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+
+        # Per-head QK RMSNorm before RoPE (critical for Qwen3)
+        q = head_rms_norm(q, layer.q_norm_weight)
+        k = head_rms_norm(k, layer.k_norm_weight)
 
         # RoPE (eager)
         cos, sin = self.rotary.get(seq_len, offset=start_pos, device=self.device)
