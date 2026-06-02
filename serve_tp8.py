@@ -20,9 +20,6 @@ import torch
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64
 import torch.distributed as dist
-from PIL import Image
-from io import BytesIO
-import urllib.request
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -64,29 +61,15 @@ dist.barrier()
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
     print("\n" + "=" * 60)
-    print("  WARMUP: Image inference (compiles prefill + decode NEFFs)")
+    print("  WARMUP: Text-only (compiles prefill + decode NEFFs)")
     print("=" * 60)
 
-IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
-if rank == 0:
-    print(f"  Downloading image...")
-with urllib.request.urlopen(IMAGE_URL) as response:
-    image_data = response.read()
-image = Image.open(BytesIO(image_data)).convert("RGB")
-
-messages = [{"role": "user", "content": [
-    {"type": "image", "image": image},
-    {"type": "text", "text": "Describe this image."},
-]}]
-
-text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
-
-# For now, use text-only path (embed input_ids directly) to validate decoder
-# Vision embedding merge will be added once decoder is validated
-input_ids = inputs["input_ids"].to(NEURON_DEVICE)
+# Use a simple text prompt to validate the decoder without vision encoder
+prompt = "The capital of France is"
+input_ids = processor(text=[prompt], return_tensors="pt")["input_ids"].to(NEURON_DEVICE)
 
 if rank == 0:
+    print(f"  Prompt: '{prompt}'")
     print(f"  Input seq_len={input_ids.shape[-1]}")
     print(f"  Running generate(max_new_tokens=10)...")
     t0 = time.time()
@@ -101,7 +84,7 @@ if rank == 0:
 
 dist.barrier()
 
-# Cached run
+# Cached run — same shape, should reuse NEFFs
 if rank == 0:
     print(f"\n  Running again (cached NEFFs)...")
     t0 = time.time()
