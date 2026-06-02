@@ -1,17 +1,31 @@
 """Qwen3-VL-8B-Instruct TP-8 server on PyTorch Native (Neuron).
 
-Clean tensor-parallel implementation using proper nn.Module wrappers
-for all_reduce/all_gather — no monkey-patching.
+Sub-module compilation: compile individual linear projections with fullgraph=True,
+leave attention score computation in eager. This avoids 800+ graph fragmentation
+from compiling full attention modules with dynamic KV cache shapes.
 
 Architecture:
   - 8 NeuronCores, 1 per rank (torchrun --nproc_per_node=8)
   - LLM decoder: TP-8 sharded (column-parallel Q/K/V/gate/up, row-parallel O/down)
-  - Vision encoder: replicated on all ranks
+  - Vision encoder: replicated on all ranks (eager, not compiled)
   - embed_tokens: replicated, lm_head: column-parallel with all_gather
+  - torch.compile(fullgraph=True) on individual projections only
+  - Attention math (RoPE, softmax, masking, KV cache) runs in eager
 
 Model dims (Qwen3-VL-8B):
   hidden_size=4096, num_heads=32, num_kv_heads=8, intermediate=12288
   head_dim=128, 36 layers, vocab=151936
+
+TP-8 sharding:
+  Q: 32 -> 4/rank, K: 8 -> 1/rank, V: 8 -> 1/rank (column-parallel)
+  O: row-parallel (512 input dim/rank)
+  gate/up: 12288 -> 1536/rank (column), down: row-parallel
+  lm_head: 151936 -> 18992/rank (column + all_gather)
+
+Compilation strategy (from rolling-forcing):
+  - Compile: q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, lm_head
+  - Eager: attention scores, RoPE, softmax, masking, KV cache, vision encoder
+  - Result: ~2 compiled shapes per projection (prefill + decode) instead of 800+
 """
 
 import os
@@ -20,6 +34,8 @@ import time
 import threading
 
 import torch
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 128
 import torch.nn as nn
 import torch.distributed as dist
 import numpy as np
@@ -29,12 +45,15 @@ import urllib.request
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# TP Wrapper Modules — clean all_reduce/all_gather inside forward()
+# TP Wrapper Modules
 # ═══════════════════════════════════════════════════════════════════════
 
 class TPAttention(nn.Module):
-    """Wraps attention with all_reduce after row-parallel o_proj."""
+    """Wraps attention with all_reduce after row-parallel o_proj.
 
+    The internal projections (q/k/v/o_proj) are already compiled individually.
+    This wrapper only adds the collective — it sits OUTSIDE compiled graphs.
+    """
     def __init__(self, attn):
         super().__init__()
         self.attn = attn
@@ -51,8 +70,11 @@ class TPAttention(nn.Module):
 
 
 class TPMLP(nn.Module):
-    """Wraps MLP with all_reduce after row-parallel down_proj."""
+    """Wraps MLP with all_reduce after row-parallel down_proj.
 
+    Internal gate/up/down projections are compiled individually.
+    The activation (silu) between them runs in eager (fast elementwise).
+    """
     def __init__(self, mlp):
         super().__init__()
         self.mlp = mlp
@@ -64,8 +86,7 @@ class TPMLP(nn.Module):
 
 
 class TPLMHead(nn.Module):
-    """Wraps column-parallel lm_head with all_gather to reconstruct full vocab logits."""
-
+    """Column-parallel lm_head with all_gather to reconstruct full vocab logits."""
     def __init__(self, lm_head, tp_size):
         super().__init__()
         self.lm_head = lm_head
@@ -83,13 +104,10 @@ class TPLMHead(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════
 
 def shard_column(weight, rank, tp):
-    """Split output dimension (dim=0) into tp chunks, take rank's chunk."""
     chunk_size = weight.shape[0] // tp
     return weight[rank * chunk_size : (rank + 1) * chunk_size].contiguous()
 
-
 def shard_row(weight, rank, tp):
-    """Split input dimension (dim=1) into tp chunks, take rank's chunk."""
     chunk_size = weight.shape[1] // tp
     return weight[:, rank * chunk_size : (rank + 1) * chunk_size].contiguous()
 
@@ -100,15 +118,23 @@ def shard_row(weight, rank, tp):
 dist.init_process_group(backend="neuron")
 rank = dist.get_rank()
 world_size = dist.get_world_size()
-assert world_size == 8, f"Expected 8 ranks, got {world_size}"
+TP = world_size
+assert TP == 8, f"Expected 8 ranks, got {TP}"
 
 torch.neuron.set_device(rank)
 NEURON_DEVICE = torch.device("neuron")
 
+MAX_NFRAMES = int(os.environ.get("QWEN3_VL_MAX_NFRAMES", "4"))
+MAX_NEW_TOKENS_DEFAULT = int(os.environ.get("QWEN3_VL_MAX_NEW_TOKENS", "256"))
+
 if rank == 0:
     print("=" * 60)
-    print(f"  Qwen3-VL-8B-Instruct TP-8 on PyTorch Native (Neuron)")
-    print(f"  World size: {world_size}")
+    print(f"  Qwen3-VL-8B-Instruct TP-8 (Neuron)")
+    print(f"  Sub-module compilation: Q/K/V/O + gate/up/down + lm_head")
+    print(f"  Attention math + vision encoder: eager")
+    print(f"  World size: {TP}")
+    print(f"  MAX_NFRAMES: {MAX_NFRAMES}")
+    print(f"  MAX_NEW_TOKENS: {MAX_NEW_TOKENS_DEFAULT}")
     print("=" * 60)
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -125,22 +151,19 @@ processor = AutoProcessor.from_pretrained(MODEL_PATH)
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_PATH,
     dtype=torch.bfloat16,
-    attn_implementation="eager",  # Force eager attention (not SDPA) for Neuron compatibility
+    attn_implementation="eager",
 ).eval().requires_grad_(False)
 
-# ─── Shard LLM decoder layers ──────────────────────────────────────
-TP = world_size
 lang_model = model.model.language_model
 
-# Update config for sharded head counts
-lang_model.config.num_attention_heads = lang_model.config.num_attention_heads // TP
-lang_model.config.num_key_value_heads = lang_model.config.num_key_value_heads // TP
+# TP-8: Q 32->4/rank, K 8->1/rank, V 8->1/rank
+lang_model.config.num_attention_heads = 32 // TP    # 4 per rank
+lang_model.config.num_key_value_heads = 8 // TP     # 1 per rank
 
 for layer in lang_model.layers:
     attn = layer.self_attn
     mlp = layer.mlp
 
-    # Attention: column-parallel Q/K/V, row-parallel O
     attn.q_proj.weight = nn.Parameter(shard_column(attn.q_proj.weight.data, rank, TP), requires_grad=False)
     if attn.q_proj.bias is not None:
         attn.q_proj.bias = nn.Parameter(shard_column(attn.q_proj.bias.data.unsqueeze(1), rank, TP).squeeze(1), requires_grad=False)
@@ -155,61 +178,68 @@ for layer in lang_model.layers:
 
     attn.o_proj.weight = nn.Parameter(shard_row(attn.o_proj.weight.data, rank, TP), requires_grad=False)
 
-    # MLP: column-parallel gate/up, row-parallel down
     mlp.gate_proj.weight = nn.Parameter(shard_column(mlp.gate_proj.weight.data, rank, TP), requires_grad=False)
     mlp.up_proj.weight = nn.Parameter(shard_column(mlp.up_proj.weight.data, rank, TP), requires_grad=False)
     mlp.down_proj.weight = nn.Parameter(shard_row(mlp.down_proj.weight.data, rank, TP), requires_grad=False)
 
-# lm_head: column-parallel
 lm_head_chunks = model.lm_head.weight.data.shape[0] // TP
 model.lm_head.weight = nn.Parameter(
     model.lm_head.weight.data[rank * lm_head_chunks : (rank + 1) * lm_head_chunks].contiguous(),
     requires_grad=False)
 
 if rank == 0:
-    print(f"  Sharded 36 decoder layers for TP-{TP}")
-    print(f"  lm_head: column-parallel ({lm_head_chunks} vocab/rank)")
-    print(f"  Vision encoder: replicated on all ranks")
+    print(f"  Sharded 36 layers: Q 4h/r, KV 1h/r, MLP 1536/r, lm_head {lm_head_chunks}/r")
+    print(f"  Vision encoder: replicated on all ranks (eager)")
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 2: Wrap with TP modules, move to Neuron, compile
+# STEP 2: Move to Neuron, compile projections, wrap with TP
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print("  Moving sharded model to Neuron...")
+    print("\n[STEP 2] Moving to Neuron...")
 model = model.to(NEURON_DEVICE)
 
-# PURE EAGER TEST — no torch.compile at all
-# This isolates whether the TP logic itself is correct
 if rank == 0:
-    print("  [PURE EAGER] Skipping torch.compile — running entirely in eager mode")
+    print("  Compiling individual projections (fullgraph=True)...")
 compile_start = time.time()
 
-# Wrap with TP modules (all_reduce/all_gather)
-if rank == 0:
-    print("  Wrapping with TP modules (all_reduce/all_gather)...")
+_compile = lambda m: torch.compile(m, backend='neuron', dynamic=False, fullgraph=True)
 
-for layer in lang_model.layers:
-    layer.self_attn = TPAttention(layer.self_attn)
-    layer.mlp = TPMLP(layer.mlp)
+for i, layer in enumerate(lang_model.layers):
+    layer.self_attn.q_proj = _compile(layer.self_attn.q_proj)
+    layer.self_attn.k_proj = _compile(layer.self_attn.k_proj)
+    layer.self_attn.v_proj = _compile(layer.self_attn.v_proj)
+    layer.self_attn.o_proj = _compile(layer.self_attn.o_proj)
+    layer.mlp.gate_proj = _compile(layer.mlp.gate_proj)
+    layer.mlp.up_proj = _compile(layer.mlp.up_proj)
+    layer.mlp.down_proj = _compile(layer.mlp.down_proj)
 
-model.lm_head = TPLMHead(model.lm_head, TP)
+model.lm_head = _compile(model.lm_head)
 
 compile_time = time.time() - compile_start
 if rank == 0:
-    print(f"  Compiled in {compile_time:.2f}s")
+    print(f"  torch.compile setup: {compile_time:.2f}s (lazy — actual compilation on first call)")
+    print(f"  Compiled: 36×(q/k/v/o + gate/up/down) + lm_head = {36*7 + 1} modules")
+
+# Wrap with TP modules (all_reduce/all_gather OUTSIDE compiled graphs)
+if rank == 0:
+    print("  Wrapping with TP modules (collectives outside compiled graphs)...")
+for layer in lang_model.layers:
+    layer.self_attn = TPAttention(layer.self_attn)
+    layer.mlp = TPMLP(layer.mlp)
+model.lm_head = TPLMHead(model.lm_head, TP)
 
 dist.barrier()
 if rank == 0:
-    print("\n  TP-8 setup complete!")
-    print(f"  Each rank: ~1B params on 1 NeuronCore")
+    print(f"\n  TP-{TP} + sub-module compilation setup complete!")
     print()
 
 # ═══════════════════════════════════════════════════════════════════════
-# WARMUP: Image inference (triggers compilation)
+# WARMUP: Image inference (triggers compilation for prefill + decode shapes)
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
     print("=" * 60)
-    print("  WARMUP: Image Inference (triggers compilation)")
+    print("  WARMUP: Image Inference (triggers Neuron compilation)")
+    print("  Expected: 2 NEFFs per projection (prefill seq_len + decode seq_len=1)")
     print("=" * 60)
 
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
@@ -221,22 +251,17 @@ image = Image.open(BytesIO(image_data)).convert("RGB")
 if rank == 0:
     print(f"Image loaded: {image.size}")
 
-messages = [
-    {
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "Describe this image in detail."},
-        ],
-    }
-]
+messages = [{"role": "user", "content": [
+    {"type": "image", "image": image},
+    {"type": "text", "text": "Describe this image in detail."},
+]}]
 
 text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
 inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
 if rank == 0:
-    print("\n[WARMUP] Running first inference (includes compilation)...")
+    print("\n[WARMUP] Running first inference (compiles prefill + decode NEFFs)...")
     warmup_start = time.time()
 
 with torch.no_grad():
@@ -248,21 +273,18 @@ if rank == 0:
     input_len = inputs["input_ids"].shape[-1]
     generated_ids = output_ids_cpu[:, input_len:]
     response_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-
-    print(f"\n{'─' * 40}")
-    print(f"WARMUP COMPLETE ({warmup_time:.2f}s):")
-    print(f"{'─' * 40}")
+    print(f"\nWARMUP COMPLETE ({warmup_time:.2f}s):")
     print(response_text[:200])
-    print(f"{'─' * 40}\n")
+    print()
 
 dist.barrier()
 
 # ═══════════════════════════════════════════════════════════════════════
-# WARMUP 2: Video inference (triggers compilation for video seq lengths)
+# WARMUP 2: Video inference (may trigger compilation for different seq_len)
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
     print("=" * 60)
-    print("  WARMUP 2: Video Inference (triggers compilation)")
+    print("  WARMUP 2: Video Inference")
     print("=" * 60)
 
 VIDEO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-VL/space_woaudio.mp4"
@@ -276,15 +298,10 @@ if rank == 0:
 
     from qwen_vl_utils import process_vision_info
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video", "video": VIDEO_PATH, "nframes": 4},
-                {"type": "text", "text": "Describe what is happening in this video."},
-            ],
-        }
-    ]
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video": VIDEO_PATH, "nframes": MAX_NFRAMES},
+        {"type": "text", "text": "Describe what is happening in this video."},
+    ]}]
 
     text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
@@ -298,7 +315,7 @@ vid_inputs = torch.load(VIDEO_INPUTS_PATH, weights_only=False)
 vid_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in vid_inputs.items()}
 
 if rank == 0:
-    print("\n[WARMUP 2] Video inference (includes compilation for video seq length)...")
+    print("\n[WARMUP 2] Video inference...")
     warmup2_start = time.time()
 
 with torch.no_grad():
@@ -310,12 +327,9 @@ if rank == 0:
     vid_input_len = vid_inputs["input_ids"].shape[-1]
     vid_generated = vid_output_ids_cpu[:, vid_input_len:]
     vid_response = processor.batch_decode(vid_generated, skip_special_tokens=True)[0]
-
-    print(f"\n{'─' * 40}")
-    print(f"VIDEO WARMUP COMPLETE ({warmup2_time:.2f}s):")
-    print(f"{'─' * 40}")
+    print(f"\nVIDEO WARMUP COMPLETE ({warmup2_time:.2f}s):")
     print(vid_response[:200])
-    print(f"{'─' * 40}\n")
+    print()
 
 dist.barrier()
 
@@ -350,7 +364,7 @@ if rank == 0:
     from pydantic import BaseModel
     from typing import List, Optional, Any
 
-    app = FastAPI(title="Qwen3-VL-8B-Instruct (PyTorch Native, TP-8)")
+    app = FastAPI(title="Qwen3-VL-8B-Instruct (TP-8)")
 
     inference_lock = threading.Lock()
 
@@ -389,7 +403,6 @@ if rank == 0:
         with inference_lock:
             start_time = time.time()
 
-            # Parse messages into Qwen VL format
             qwen_messages = []
             for msg in request.messages:
                 if isinstance(msg.content, str):
@@ -404,7 +417,6 @@ if rank == 0:
                             elif item.get("type") == "video_url":
                                 url = item.get("video_url", {}).get("url", "")
                                 if url.startswith("data:video/"):
-                                    # Decode base64 data URI to temp file
                                     import base64 as b64mod
                                     import tempfile as tmpmod
                                     header, b64data = url.split(",", 1)
@@ -413,9 +425,9 @@ if rank == 0:
                                     tmp.write(video_bytes)
                                     tmp.close()
                                     print(f"  Decoded video data URI to {tmp.name} ({len(video_bytes)} bytes)")
-                                    content_items.append({"type": "video", "video": tmp.name, "nframes": 4})
+                                    content_items.append({"type": "video", "video": tmp.name, "nframes": MAX_NFRAMES})
                                 else:
-                                    content_items.append({"type": "video", "video": url, "nframes": 4})
+                                    content_items.append({"type": "video", "video": url, "nframes": MAX_NFRAMES})
                             elif item.get("type") in ("image", "video", "text"):
                                 content_items.append(item)
                             else:
@@ -436,14 +448,11 @@ if rank == 0:
                 return_tensors="pt"
             )
 
-            # Save inputs for other ranks
             torch.save(req_inputs, INPUTS_PATH)
 
-            # Signal other ranks
             max_tokens_tensor = torch.tensor([request.max_tokens or 256], dtype=torch.long).to(NEURON_DEVICE)
             dist.broadcast(max_tokens_tensor, src=0)
 
-            # Run inference (all ranks participate)
             response_text = run_inference(INPUTS_PATH, max_tokens=request.max_tokens or 256)
 
             elapsed = time.time() - start_time
@@ -462,12 +471,10 @@ if rank == 0:
     server_thread.start()
     print(f"\n[SERVER] FastAPI running on port 8000")
 
-    # Rank 0 main thread: keep alive
     while True:
         time.sleep(0.1)
 
 else:
-    # Non-rank-0: wait for broadcast signals from rank 0
     while True:
         try:
             max_tokens_tensor = torch.tensor([256], dtype=torch.long).to(NEURON_DEVICE)
