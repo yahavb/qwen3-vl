@@ -117,4 +117,4 @@ dist.barrier()
 dist.barrier()
 if rank == 0:
     print("\n[DONE] Profiling complete. Exiting.")
-dist.destroy_process_group()
+sys.exit(0)

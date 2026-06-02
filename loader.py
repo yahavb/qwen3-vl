@@ -83,7 +83,15 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
         v_w = shard_column(attn.v_proj.weight.data, rank, TP)
         qkv_w = torch.cat([q_w, k_w, v_w], dim=0).t().contiguous()
 
-        # O proj: row-parallel, transpose for x @ W
+        # Fuse QKV bias (if present)
+        qkv_bias = None
+        if attn.q_proj.bias is not None:
+            q_b = shard_column(attn.q_proj.bias.data.unsqueeze(1), rank, TP).squeeze(1)
+            k_b = shard_column(attn.k_proj.bias.data.unsqueeze(1), rank, TP).squeeze(1)
+            v_b = shard_column(attn.v_proj.bias.data.unsqueeze(1), rank, TP).squeeze(1)
+            qkv_bias = torch.cat([q_b, k_b, v_b], dim=0).contiguous()
+
+        # O proj: row-parallel, transpose for x @ W (no bias in Qwen3)
         o_w = shard_row(attn.o_proj.weight.data, rank, TP).t().contiguous()
 
         # Fuse gate+up: column-shard each, concatenate, transpose
@@ -105,7 +113,7 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
         )
 
         layers.append(DecoderLayer(
-            qkv=FusedLinear(qkv_w),
+            qkv=FusedLinear(qkv_w, qkv_bias),
             o_proj=FusedLinear(o_w),
             gate_up=FusedLinear(gate_up_w),
             down=FusedLinear(down_w),

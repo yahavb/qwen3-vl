@@ -22,13 +22,17 @@ import torch.distributed as dist
 
 
 class FusedLinear(nn.Module):
-    """x @ weight — single matmul, compiled as one NEFF."""
-    def __init__(self, weight):
+    """x @ weight + bias — single matmul, compiled as one NEFF."""
+    def __init__(self, weight, bias=None):
         super().__init__()
         self.weight = nn.Parameter(weight, requires_grad=False)
+        self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
 
     def forward(self, x):
-        return x @ self.weight
+        out = x @ self.weight
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
 class RMSNorm(nn.Module):
