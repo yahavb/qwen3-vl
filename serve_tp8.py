@@ -125,7 +125,7 @@ if rank == 0:
 from PIL import Image
 from io import BytesIO
 import urllib.request
-from vision import get_vision_embeddings, merge_vision_embeddings
+from vision import prepare_vision_embeds
 
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
 if rank == 0:
@@ -142,38 +142,17 @@ messages = [{"role": "user", "content": [
 text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
 
-input_ids = inputs["input_ids"].to(NEURON_DEVICE)
-pixel_values = inputs.get("pixel_values")
-image_grid_thw = inputs.get("image_grid_thw")
-
-if pixel_values is not None:
-    pixel_values = pixel_values.to(NEURON_DEVICE)
-if image_grid_thw is not None:
-    image_grid_thw = image_grid_thw.to(NEURON_DEVICE)
-
 if rank == 0:
-    print(f"  Input seq_len={input_ids.shape[-1]}")
-    print(f"  pixel_values shape={pixel_values.shape if pixel_values is not None else None}")
-    print(f"  image_grid_thw={image_grid_thw}")
-
-# Run vision encoder (eager)
-if rank == 0:
-    print(f"  Running vision encoder...")
+    print(f"  Input seq_len={inputs['input_ids'].shape[-1]}")
+    print(f"  Running vision encoder + merge...")
     t0 = time.time()
 
-image_embeds, _ = get_vision_embeddings(hf_model, pixel_values, image_grid_thw)
+inputs_embeds = prepare_vision_embeds(hf_model, processor, inputs, NEURON_DEVICE)
 
 if rank == 0:
     vis_time = time.time() - t0
-    print(f"  Vision encoder: {vis_time:.2f}s")
-    if image_embeds is not None:
-        print(f"  image_embeds shape={image_embeds.shape}")
-
-# Merge vision embeddings into text
-inputs_embeds = merge_vision_embeddings(decoder.embed_tokens, input_ids, image_embeds=image_embeds)
-
-if rank == 0:
-    print(f"  Merged inputs_embeds shape={inputs_embeds.shape}")
+    print(f"  Vision + merge: {vis_time:.2f}s")
+    print(f"  inputs_embeds shape={inputs_embeds.shape}")
     print(f"  Generating with vision (max_new_tokens=30)...")
     t0 = time.time()
 
