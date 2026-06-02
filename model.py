@@ -175,11 +175,11 @@ class Qwen3VLDecoder:
         k_full = k_cache[:, :, :valid_len, :]
         v_full = v_cache[:, :, :valid_len, :]
 
-        # GQA: expand KV heads to match Q heads
+        # GQA: expand KV heads to match Q heads (expand+reshape, no repeat_interleave)
         if self.num_kv_heads < self.num_q_heads:
             repeat = self.num_q_heads // self.num_kv_heads
-            k_full = k_full.repeat_interleave(repeat, dim=1)
-            v_full = v_full.repeat_interleave(repeat, dim=1)
+            k_full = k_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, valid_len, self.head_dim)
+            v_full = v_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, valid_len, self.head_dim)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
