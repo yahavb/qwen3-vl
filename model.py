@@ -62,12 +62,15 @@ class RotaryEmbedding:
 
 
 def apply_rotary(x, cos, sin):
-    """Apply RoPE to x: [batch, heads, seq, head_dim]."""
-    d = x.shape[-1] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, d]
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    """Apply RoPE (rotate_half style, matching Qwen3/Llama) to x: [batch, heads, seq, head_dim]."""
+    def rotate_half(t):
+        t1, t2 = t.chunk(2, dim=-1)
+        return torch.cat((-t2, t1), dim=-1)
+
+    # cos/sin are [seq, head_dim/2], need to broadcast to [1, 1, seq, head_dim]
+    cos = torch.cat([cos, cos], dim=-1).unsqueeze(0).unsqueeze(0)
+    sin = torch.cat([sin, sin], dim=-1).unsqueeze(0).unsqueeze(0)
+    return x * cos + rotate_half(x) * sin
 
 
 class DecoderLayer:

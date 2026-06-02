@@ -5,7 +5,6 @@ metadata:
   namespace: default
 spec:
   backoffLimit: 0
-  activeDeadlineSeconds: 86400
   template:
     metadata:
       labels:
@@ -105,34 +104,6 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: HF_TOKEN
-          ports:
-            - containerPort: 8000
-              protocol: TCP
-          startupProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            periodSeconds: 30
-            timeoutSeconds: 100
-            failureThreshold: 475
-          readinessProbe:
-            httpGet:
-              path: /readiness
-              port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            successThreshold: 1
-            failureThreshold: 3
-            timeoutSeconds: 5
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: 8000
-            initialDelaySeconds: 600
-            periodSeconds: 300
-            successThreshold: 1
-            failureThreshold: 1000
-            timeoutSeconds: 60
       volumes:
         - name: dshm
           emptyDir:
