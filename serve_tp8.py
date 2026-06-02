@@ -147,16 +147,23 @@ if rank == 0:
     print(f"  Running vision encoder + merge...")
     t0 = time.time()
 
-inputs_embeds = prepare_vision_embeds(hf_model, processor, inputs, NEURON_DEVICE)
+inputs_embeds, deepstack_embeds, visual_mask = prepare_vision_embeds(hf_model, processor, inputs, NEURON_DEVICE)
 
 if rank == 0:
     vis_time = time.time() - t0
     print(f"  Vision + merge: {vis_time:.2f}s")
     print(f"  inputs_embeds shape={inputs_embeds.shape}")
-    print(f"  Generating with vision (max_new_tokens=30)...")
+    print(f"  deepstack: {len(deepstack_embeds) if deepstack_embeds else 0} levels")
+    if deepstack_embeds:
+        print(f"  deepstack[0] shape={deepstack_embeds[0].shape}")
+    print(f"  visual_mask: {visual_mask.sum().item() if visual_mask is not None else 0} positions")
+    print(f"  Generating with vision + deepstack (max_new_tokens=30)...")
     t0 = time.time()
 
-generated_tokens = decoder.generate_with_embeds(inputs_embeds, max_new_tokens=30)
+generated_tokens = decoder.generate_with_embeds(
+    inputs_embeds, max_new_tokens=30,
+    deepstack_embeds=deepstack_embeds, visual_mask=visual_mask
+)
 
 if rank == 0:
     img_time = time.time() - t0

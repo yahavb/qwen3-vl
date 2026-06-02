@@ -300,18 +300,29 @@ class Qwen3VLDecoder:
 
         return generated_tokens
 
-    def generate_with_embeds(self, inputs_embeds, max_new_tokens=256, eos_token_id=151645):
-        """Generate from embeddings (after vision encoder merges visual tokens).
+    def generate_with_embeds(self, inputs_embeds, max_new_tokens=256, eos_token_id=151645,
+                             deepstack_embeds=None, visual_mask=None):
+        """Generate from embeddings with deepstack injection.
 
-        Same as generate() but starts from embeddings instead of token IDs.
+        Args:
+            inputs_embeds: [1, seq_len, hidden] merged text+vision embeddings
+            deepstack_embeds: list of [num_visual_tokens, hidden] tensors to inject
+                after decoder layers 0, 1, 2 (from vision encoder layers 8, 16, 24)
+            visual_mask: [seq_len] bool mask of visual token positions
         """
         bsz, prompt_len, _ = inputs_embeds.shape
         kv_cache = self.init_kv_cache(batch_size=bsz)
 
-        # Prefill from embeddings (bypass embed_tokens)
+        # Prefill from embeddings with deepstack injection
         hidden = inputs_embeds
         for i in range(self.num_layers):
             hidden = self.forward_layer(hidden, i, kv_cache, start_pos=0, seq_len=prompt_len)
+
+            # Deepstack: add vision features after specific layers (during prefill only)
+            if deepstack_embeds is not None and visual_mask is not None and i < len(deepstack_embeds):
+                hidden = hidden.clone()
+                hidden[0, visual_mask] = hidden[0, visual_mask] + deepstack_embeds[i].to(hidden.dtype)
+
         hidden = self.final_norm(hidden)
         last_hidden = hidden[:, -1:, :]
         local_logits = self.lm_head(last_hidden)
@@ -322,7 +333,7 @@ class Qwen3VLDecoder:
         next_token = logits[:, -1, :].argmax(dim=-1)
         generated_tokens = [next_token.item()]
 
-        # Decode loop
+        # Decode loop (no deepstack — only injected during prefill)
         for i in range(max_new_tokens - 1):
             pos = prompt_len + i
             logits = self.decode_step(next_token, pos, kv_cache)
