@@ -258,7 +258,9 @@ messages = [{"role": "user", "content": [
 
 text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
-inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+GRID_KEYS = {"image_grid_thw", "video_grid_thw"}
+inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) and k not in GRID_KEYS else v
+          for k, v in inputs.items()}
 
 if rank == 0:
     print("\n[WARMUP] Running first inference (compiles prefill + decode NEFFs)...")
@@ -312,7 +314,8 @@ if rank == 0:
 dist.barrier()
 
 vid_inputs = torch.load(VIDEO_INPUTS_PATH, weights_only=False)
-vid_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in vid_inputs.items()}
+vid_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) and k not in GRID_KEYS else v
+              for k, v in vid_inputs.items()}
 
 if rank == 0:
     print("\n[WARMUP 2] Video inference...")
@@ -345,7 +348,8 @@ INPUTS_PATH = "/tmp/current_inputs.pt"
 def run_inference(inputs_path, max_tokens=256):
     """All ranks load inputs from file and run generate together."""
     loaded_inputs = torch.load(inputs_path, weights_only=False)
-    loaded_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) else v for k, v in loaded_inputs.items()}
+    loaded_inputs = {k: v.to(NEURON_DEVICE) if isinstance(v, torch.Tensor) and k not in GRID_KEYS else v
+                     for k, v in loaded_inputs.items()}
 
     with torch.no_grad():
         output_ids = model.generate(**loaded_inputs, max_new_tokens=max_tokens, do_sample=False)
