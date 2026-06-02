@@ -114,8 +114,17 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
         )
 
         # Per-head QK RMSNorm weights (Qwen3 applies RMSNorm to Q and K before RoPE)
-        q_norm_w = attn.q_norm.weight.data.clone() if hasattr(attn, 'q_norm') else torch.ones(HEAD_DIM)
-        k_norm_w = attn.k_norm.weight.data.clone() if hasattr(attn, 'k_norm') else torch.ones(HEAD_DIM)
+        if hasattr(attn, 'q_norm'):
+            q_norm_w = attn.q_norm.weight.data.clone()
+            k_norm_w = attn.k_norm.weight.data.clone()
+            if i == 0 and rank == 0:
+                print(f"  QK norm found: q_norm shape={q_norm_w.shape}, k_norm shape={k_norm_w.shape}")
+        else:
+            q_norm_w = torch.ones(HEAD_DIM)
+            k_norm_w = torch.ones(HEAD_DIM)
+            if i == 0 and rank == 0:
+                attn_attrs = [a for a in dir(attn) if 'norm' in a.lower()]
+                print(f"  WARNING: No q_norm found! Attn norm attrs: {attn_attrs}")
 
         layers.append(DecoderLayer(
             qkv=FusedLinear(qkv_w, qkv_bias),
