@@ -25,8 +25,9 @@ def prepare_vision_embeds(hf_model, processor, inputs, device):
     pixel_values = inputs.get("pixel_values")
     image_grid_thw = inputs.get("image_grid_thw")
 
+    visual = hf_model.model.visual if hasattr(hf_model.model, 'visual') else hf_model.visual
     if pixel_values is not None:
-        pixel_values = pixel_values.to(dtype=hf_model.visual.dtype, device=device)
+        pixel_values = pixel_values.to(dtype=visual.dtype, device=device)
     if image_grid_thw is not None:
         image_grid_thw = image_grid_thw.to(device)
 
@@ -39,7 +40,7 @@ def prepare_vision_embeds(hf_model, processor, inputs, device):
     if pixel_values is not None and image_grid_thw is not None:
         with torch.no_grad():
             # Run vision encoder — returns BaseModelOutputWithDeepstackFeatures
-            vision_output = hf_model.visual(
+            vision_output = visual(
                 pixel_values, grid_thw=image_grid_thw, return_dict=True
             )
 
