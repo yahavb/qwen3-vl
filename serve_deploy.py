@@ -125,7 +125,31 @@ decoder.generate_with_embeds(inputs_embeds, max_new_tokens=10,
                              deepstack_embeds=deepstack_embeds, visual_mask=visual_mask)
 
 if rank == 0:
-    print(f"  Image warmup: {time.time()-t0:.1f}s")
+    print(f"  Image warmup (640x480): {time.time()-t0:.1f}s, seq_len={inputs_embeds.shape[1]}")
+
+dist.barrier()
+
+# Warmup with a second image at different resolution (common from eval app: 1024x1024)
+if rank == 0:
+    print("[WARMUP 2b/3] Image at 1024x1024 (compiles second prefill NEFF)...")
+    t0 = time.time()
+
+image_1024 = image.resize((1024, 1024))
+messages_1024 = [{"role": "user", "content": [
+    {"type": "image", "image": image_1024},
+    {"type": "text", "text": "Describe."},
+]}]
+text_prompt_1024 = processor.apply_chat_template(messages_1024, tokenize=False, add_generation_prompt=True)
+warmup_inputs_1024 = processor(text=[text_prompt_1024], images=[image_1024], return_tensors="pt")
+
+embeds_1024, ds_1024, mask_1024 = prepare_vision_embeds(
+    hf_model, processor, warmup_inputs_1024, NEURON_DEVICE
+)
+decoder.generate_with_embeds(embeds_1024, max_new_tokens=5,
+                             deepstack_embeds=ds_1024, visual_mask=mask_1024)
+
+if rank == 0:
+    print(f"  Image warmup (1024x1024): {time.time()-t0:.1f}s, seq_len={embeds_1024.shape[1]}")
 
 dist.barrier()
 
@@ -311,7 +335,20 @@ if rank == 0:
                 response_text = run_text_inference(input_ids, max_tokens)
 
             elapsed = time.time() - start_time
-            print(f"  Request ({('vision' if has_vision else 'text')}): {elapsed:.2f}s")
+            has_image = any(
+                item.get("type") == "image_url"
+                for msg in request.messages if not isinstance(msg.content, str)
+                for item in (msg.content if not isinstance(msg.content, str) else [])
+                if isinstance(item, dict)
+            ) if has_vision else False
+            has_video = any(
+                item.get("type") == "video_url"
+                for msg in request.messages if not isinstance(msg.content, str)
+                for item in (msg.content if not isinstance(msg.content, str) else [])
+                if isinstance(item, dict)
+            ) if has_vision else False
+            modality = "video" if has_video else ("image" if has_image else "text")
+            print(f"  Request ({modality}): {elapsed:.2f}s")
 
             return ChatResponse(
                 choices=[ChatChoice(message={"role": "assistant", "content": response_text})]
