@@ -122,12 +122,13 @@ class Qwen3VLDecoder:
         self.kv_dim = num_kv_heads * head_dim
 
     def init_kv_cache(self, batch_size=1):
-        """Allocate static KV cache — fixed shape, never reallocated."""
+        """Allocate static KV cache — stored at Q head count (pre-expanded for GQA)."""
         cache = []
         for _ in range(self.num_layers):
-            k = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
+            # Store at num_q_heads (not num_kv_heads) to avoid repeat_interleave at runtime
+            k = torch.zeros(batch_size, self.num_q_heads, self.max_seq_len, self.head_dim,
                           dtype=torch.bfloat16, device=self.device)
-            v = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
+            v = torch.zeros(batch_size, self.num_q_heads, self.max_seq_len, self.head_dim,
                           dtype=torch.bfloat16, device=self.device)
             cache.append((k, v))
         return cache
@@ -152,22 +153,21 @@ class Qwen3VLDecoder:
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # KV cache update (eager, in-place)
+        # GQA expand K/V at write time (avoid repeat_interleave at attention time)
+        if self.num_kv_heads < self.num_q_heads:
+            repeat = self.num_q_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat, dim=1)
+            v = v.repeat_interleave(repeat, dim=1)
+
+        # KV cache update (eager, in-place) — cache is stored at num_q_heads
         k_cache, v_cache = kv_cache[layer_idx]
         k_cache[:, :, start_pos:start_pos+seq_len, :] = k
         v_cache[:, :, start_pos:start_pos+seq_len, :] = v
 
-        # Attention (eager, dynamic shapes OK — not compiled)
-        # Slice KV cache to valid range only
+        # Attention (eager) — slice to valid range
         valid_len = start_pos + seq_len
         k_full = k_cache[:, :, :valid_len, :]
         v_full = v_cache[:, :, :valid_len, :]
-
-        # GQA: expand KV heads to match Q heads
-        if self.num_kv_heads < self.num_q_heads:
-            repeat = self.num_q_heads // self.num_kv_heads
-            k_full = k_full.repeat_interleave(repeat, dim=1)
-            v_full = v_full.repeat_interleave(repeat, dim=1)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
