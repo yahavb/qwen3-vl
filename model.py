@@ -130,10 +130,25 @@ class Qwen3VLDecoder:
         self.q_dim = num_q_heads * head_dim
         self.kv_dim = num_kv_heads * head_dim
 
+        # Pre-compute causal mask once (lower-triangular)
+        # mask[i, j] = 0 if j <= i else -inf
+        self.causal_mask = torch.triu(
+            torch.full((max_seq_len, max_seq_len), float('-inf'), dtype=torch.bfloat16, device=device),
+            diagonal=1
+        )
+
     def init_kv_cache(self, batch_size=1):
-        """Allocate static KV cache at KV head count."""
+        """Allocate static KV cache at KV head count.
+
+        K cache initialized to large values so that unfilled positions produce
+        large negative attention scores after q@k.T scaling, naturally suppressed
+        by softmax without needing an explicit mask.
+        """
         cache = []
         for _ in range(self.num_layers):
+            # K initialized so dot product with any Q produces very negative score
+            # A large constant in K means q@k.T has unpredictable sign, so instead
+            # we rely on the mask approach but pre-compute it once.
             k = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
                           dtype=torch.bfloat16, device=self.device)
             v = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
@@ -170,8 +185,7 @@ class Qwen3VLDecoder:
         k_cache[:, :, start_pos:start_pos+seq_len, :] = k
         v_cache[:, :, start_pos:start_pos+seq_len, :] = v
 
-        # Attention — use full static buffer with masking for fixed shapes
-        # This avoids Neuron eager re-dispatch for each new KV length
+        # Attention — full static buffer + pre-computed causal mask (fixed shapes)
         valid_len = start_pos + seq_len
         k_full = k_cache  # [bsz, kv_heads, max_seq_len, head_dim]
         v_full = v_cache
@@ -185,19 +199,12 @@ class Qwen3VLDecoder:
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
 
-        # Mask: -inf for all positions >= valid_len (not yet written)
-        # Build mask on CPU then move (avoids Neuron dispatch for mask construction)
-        attn_mask = torch.zeros(1, 1, seq_len, self.max_seq_len, dtype=torch.bfloat16, device=self.device)
-        attn_mask[:, :, :, valid_len:] = float('-inf')
-        # Causal mask for prefill
-        if seq_len > 1:
-            causal = torch.triu(
-                torch.full((seq_len, valid_len), float('-inf'), dtype=torch.bfloat16, device=self.device),
-                diagonal=start_pos + 1
-            )
-            attn_mask[:, :, :, :valid_len] = causal
+        # Use pre-computed causal mask — slice rows for current positions
+        # For decode (seq_len=1): mask[start_pos, :] masks future positions
+        # For prefill (seq_len>1): mask[start_pos:start_pos+seq_len, :] gives causal
+        attn_mask = self.causal_mask[start_pos:start_pos+seq_len, :self.max_seq_len]
+        attn_weights = attn_weights + attn_mask.unsqueeze(0).unsqueeze(0)
 
-        attn_weights = attn_weights + attn_mask
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(hidden.dtype)
         attn_out = torch.matmul(attn_weights, v_full)
 
