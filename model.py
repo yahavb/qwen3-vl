@@ -157,10 +157,11 @@ class Qwen3VLDecoder:
         k_cache[:, :, start_pos:start_pos+seq_len, :] = k
         v_cache[:, :, start_pos:start_pos+seq_len, :] = v
 
-        # Attention (eager) — use FULL static KV cache with mask
-        # Always attend to full max_seq_len to keep shapes static (no recompilation)
-        k_full = k_cache
-        v_full = v_cache
+        # Attention (eager, dynamic shapes OK — not compiled)
+        # Slice KV cache to valid range only
+        valid_len = start_pos + seq_len
+        k_full = k_cache[:, :, :valid_len, :]
+        v_full = v_cache[:, :, :valid_len, :]
 
         # GQA: expand KV heads to match Q heads
         if self.num_kv_heads < self.num_q_heads:
@@ -171,18 +172,14 @@ class Qwen3VLDecoder:
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
 
-        # Mask: -inf for positions beyond current sequence AND future positions
-        # This keeps the attention shape fixed regardless of position
-        valid_len = start_pos + seq_len
-        mask = torch.zeros(seq_len, self.max_seq_len, device=self.device, dtype=torch.bfloat16)
-        # Mask out future positions (beyond what we've written to KV cache)
-        mask[:, valid_len:] = float('-inf')
-        # Causal mask for prefill (within the current chunk)
+        # Causal mask for prefill only (decode attends to all past, which is correct)
         if seq_len > 1:
-            causal = torch.triu(torch.ones(seq_len, seq_len, device=self.device, dtype=torch.bfloat16), diagonal=1) * float('-inf')
-            mask[:, start_pos:valid_len] = causal
+            causal = torch.triu(
+                torch.full((seq_len, valid_len), float('-inf'), device=self.device, dtype=torch.bfloat16),
+                diagonal=start_pos + 1
+            )
+            attn_weights = attn_weights + causal.unsqueeze(0).unsqueeze(0)
 
-        attn_weights = attn_weights + mask.unsqueeze(0).unsqueeze(0)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(hidden.dtype)
         attn_out = torch.matmul(attn_weights, v_full)
 

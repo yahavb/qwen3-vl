@@ -10,6 +10,7 @@ Handles:
   - Vision encoder kept as-is (eager, replicated)
 """
 
+import os
 import time
 import torch
 import torch.nn as nn
@@ -145,7 +146,8 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
     if rope_theta is None:
         rope_scaling = getattr(config, 'rope_scaling', {}) or {}
         rope_theta = rope_scaling.get('rope_theta', 1000000.0)
-    rotary = RotaryEmbedding(HEAD_DIM, max_seq_len=8192, base=rope_theta)
+    max_seq = int(os.environ.get("MAX_SEQ_LEN", "4096"))
+    rotary = RotaryEmbedding(HEAD_DIM, max_seq_len=max_seq, base=rope_theta)
 
     if rank == 0:
         print(f"  Weights fused+sharded: {time.time()-t0:.1f}s")
@@ -187,7 +189,7 @@ def load_model(model_path, rank, world_size, device, compile_backend='neuron'):
         num_q_heads=NUM_Q_HEADS,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
-        max_seq_len=8192,
+        max_seq_len=max_seq,
         device=device,
     )
 
