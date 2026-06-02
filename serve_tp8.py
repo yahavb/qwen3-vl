@@ -117,4 +117,6 @@ dist.barrier()
 dist.barrier()
 if rank == 0:
     print("\n[DONE] Profiling complete. Exiting.")
-sys.exit(0)
+# All ranks must exit together; os._exit avoids SIGABRT from Neuron cleanup
+import os as _os
+_os._exit(0)
