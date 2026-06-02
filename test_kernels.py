@@ -32,6 +32,8 @@ SEQ_LEN = 256  # multiple of 128
 HALF_D = HEAD_DIM // 2
 
 torch.manual_seed(42)
+torch.neuron.set_device(0)
+DEVICE = torch.device("neuron")
 
 
 def check_close(name, nki_out, ref_out, rtol=1e-2, atol=1e-2):
@@ -83,22 +85,27 @@ def rope_ref(x, cos, sin):
 
 ref_out = rope_ref(x, cos_vals, sin_vals)
 
-# NKI kernel
+# NKI kernel — tensors must be on Neuron device
 print(f"  Input: x={x.shape}, cos_sin={cos_sin.shape}")
+print(f"  Moving to Neuron device...")
+x_dev = x.to(DEVICE)
+cos_sin_dev = cos_sin.to(DEVICE)
+
 print(f"  Running NKI kernel...")
 t0 = time.time()
 
 rope_kernel = wrap_nki(qwen3_rope)
-nki_out = rope_kernel(x, cos_sin, num_heads=NUM_Q_HEADS, head_dim=HEAD_DIM)
+nki_out = rope_kernel(x_dev, cos_sin_dev, num_heads=NUM_Q_HEADS, head_dim=HEAD_DIM)
 
 t1 = time.time()
 print(f"  NKI time: {t1-t0:.3f}s (includes compilation)")
 
-rope_pass = check_close("RoPE", nki_out, ref_out)
+nki_out_cpu = nki_out.cpu()
+rope_pass = check_close("RoPE", nki_out_cpu, ref_out)
 
 # Run again (cached)
 t0 = time.time()
-nki_out2 = rope_kernel(x, cos_sin, num_heads=NUM_Q_HEADS, head_dim=HEAD_DIM)
+nki_out2 = rope_kernel(x_dev, cos_sin_dev, num_heads=NUM_Q_HEADS, head_dim=HEAD_DIM)
 t1 = time.time()
 print(f"  Cached time: {t1-t0:.4f}s")
 
@@ -154,22 +161,30 @@ print(f"  Input: q={q.shape}, k={k.shape}, v={v.shape}")
 print(f"  Computing reference...")
 ref_attn_out = attention_ref(q, k, v, scale, NUM_Q_HEADS, NUM_KV_HEADS)
 
+# Move to Neuron device
+print(f"  Moving to Neuron device...")
+q_dev = q.to(DEVICE)
+k_dev = k.to(DEVICE)
+v_dev = v.to(DEVICE)
+id_dev = identity.to(DEVICE)
+
 print(f"  Running NKI kernel...")
 t0 = time.time()
 
 prefill_kernel = wrap_nki(prefill_gqa_flash_attention)
-nki_attn_out = prefill_kernel(q, k, v, identity, scale,
+nki_attn_out = prefill_kernel(q_dev, k_dev, v_dev, id_dev, scale,
                                num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
                                head_dim=HEAD_DIM)
 
 t1 = time.time()
 print(f"  NKI time: {t1-t0:.3f}s (includes compilation)")
 
-attn_pass = check_close("Prefill Attention", nki_attn_out, ref_attn_out)
+nki_attn_out_cpu = nki_attn_out.cpu()
+attn_pass = check_close("Prefill Attention", nki_attn_out_cpu, ref_attn_out)
 
 # Run again (cached)
 t0 = time.time()
-nki_attn_out2 = prefill_kernel(q, k, v, identity, scale,
+nki_attn_out2 = prefill_kernel(q_dev, k_dev, v_dev, id_dev, scale,
                                 num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
                                 head_dim=HEAD_DIM)
 t1 = time.time()
