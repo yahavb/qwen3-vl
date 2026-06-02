@@ -51,26 +51,118 @@ decoder, vision_model, processor, hf_model = load_model(
 dist.barrier()
 
 # ═══════════════════════════════════════════════════════════════════════
-# Warmup — compile prefill + decode NEFFs with a short text prompt
+# Start HTTP server BEFORE warmup so /health responds (keeps pod alive).
+# /readiness returns 503 until server_ready = True after warmup.
+# ═══════════════════════════════════════════════════════════════════════
+server_ready = False
+inference_lock = threading.Lock()
+
+if rank == 0:
+    import uvicorn
+    from fastapi import FastAPI, HTTPException
+    from pydantic import BaseModel
+    from typing import List, Optional, Any
+
+    app = FastAPI(title="Qwen3-VL-8B-Instruct")
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.get("/readiness")
+    def readiness():
+        if server_ready:
+            return {"status": "ready"}
+        raise HTTPException(status_code=503, detail="Warming up")
+
+    def _start_server():
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+    threading.Thread(target=_start_server, daemon=True).start()
+    print("[HTTP] Server running on :8000 (/health=200, /readiness=503 until warmup)")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Warmup — compile ALL NEFFs before marking ready
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    print("[WARMUP] Compiling with text prompt...")
+    print("[WARMUP 1/3] Text prompt (compiles decode NEFF)...")
     t0 = time.time()
 
-prompt = "Hello"
+prompt = "The capital of France is"
 input_ids = processor(text=[prompt], return_tensors="pt")["input_ids"].to(NEURON_DEVICE)
-decoder.generate(input_ids, max_new_tokens=5)
+decoder.generate(input_ids, max_new_tokens=10)
 
 if rank == 0:
-    print(f"[WARMUP] Done in {time.time()-t0:.1f}s")
+    print(f"  Text warmup: {time.time()-t0:.1f}s")
 
 dist.barrier()
 
-# ═══════════════════════════════════════════════════════════════════════
-# Server state
-# ═══════════════════════════════════════════════════════════════════════
+# Warmup with image — compiles vision encoder + image prefill NEFF
+if rank == 0:
+    print("[WARMUP 2/3] Image (compiles vision encoder + prefill NEFF)...")
+    t0 = time.time()
+
+from PIL import Image
+from io import BytesIO
+import urllib.request
+
+IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+with urllib.request.urlopen(IMAGE_URL) as response:
+    image_data = response.read()
+image = Image.open(BytesIO(image_data)).convert("RGB")
+
+messages = [{"role": "user", "content": [
+    {"type": "image", "image": image},
+    {"type": "text", "text": "Describe this image."},
+]}]
+text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+warmup_inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
+
+inputs_embeds, deepstack_embeds, visual_mask = prepare_vision_embeds(
+    hf_model, processor, warmup_inputs, NEURON_DEVICE
+)
+decoder.generate_with_embeds(inputs_embeds, max_new_tokens=10,
+                             deepstack_embeds=deepstack_embeds, visual_mask=visual_mask)
+
+if rank == 0:
+    print(f"  Image warmup: {time.time()-t0:.1f}s")
+
+dist.barrier()
+
+# Warmup with video — compiles video vision path + video prefill NEFF
+if rank == 0:
+    print("[WARMUP 3/3] Video (compiles video vision + prefill NEFF)...")
+    t0 = time.time()
+
+VIDEO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-VL/space_woaudio.mp4"
+VIDEO_PATH = "/tmp/warmup_video.mp4"
+VIDEO_INPUTS_PATH = "/tmp/warmup_video_inputs.pt"
+
+if rank == 0:
+    urllib.request.urlretrieve(VIDEO_URL, VIDEO_PATH)
+    from qwen_vl_utils import process_vision_info
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video": VIDEO_PATH, "nframes": MAX_NFRAMES},
+        {"type": "text", "text": "Describe this video."},
+    ]}]
+    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    vid_inputs = processor(text=[text_prompt], images=image_inputs, videos=video_inputs, return_tensors="pt")
+    torch.save(vid_inputs, VIDEO_INPUTS_PATH)
+
+dist.barrier()
+
+vid_inputs = torch.load(VIDEO_INPUTS_PATH, weights_only=False)
+vid_embeds, vid_ds, vid_mask = prepare_vision_embeds(hf_model, processor, vid_inputs, NEURON_DEVICE)
+decoder.generate_with_embeds(vid_embeds, max_new_tokens=10,
+                             deepstack_embeds=vid_ds, visual_mask=vid_mask)
+
+if rank == 0:
+    print(f"  Video warmup: {time.time()-t0:.1f}s")
+    print("[WARMUP] All compilation complete. Marking ready.")
+
+dist.barrier()
 server_ready = True
-inference_lock = threading.Lock()
 
 
 def run_vision_inference(inputs_dict, max_tokens):
@@ -96,16 +188,9 @@ def run_text_inference(input_ids, max_tokens):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Rank 0: FastAPI server
+# Rank 0: Register API endpoints (server already running from above)
 # ═══════════════════════════════════════════════════════════════════════
 if rank == 0:
-    import uvicorn
-    from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
-    from typing import List, Optional, Any
-
-    app = FastAPI(title="Qwen3-VL-8B-Instruct")
-
     class ChatMessage(BaseModel):
         role: str
         content: Any
@@ -136,16 +221,6 @@ if rank == 0:
     class ModelList(BaseModel):
         object: str = "list"
         data: List[ModelInfo]
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok"}
-
-    @app.get("/readiness")
-    def readiness():
-        if server_ready:
-            return {"status": "ready"}
-        raise HTTPException(status_code=503, detail="Not ready")
 
     @app.get("/v1/models")
     def list_models():
@@ -242,12 +317,7 @@ if rank == 0:
                 choices=[ChatChoice(message={"role": "assistant", "content": response_text})]
             )
 
-    def start_server():
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
-    server_thread = threading.Thread(target=start_server, daemon=True)
-    server_thread.start()
-    print(f"\n[SERVER] Running on port 8000")
+    print(f"\n[SERVER] API endpoints registered. Ready for requests.")
     print(f"  POST /v1/chat/completions — image_url, video_url supported")
     print(f"  GET  /v1/models")
     print(f"  GET  /health, /readiness")
