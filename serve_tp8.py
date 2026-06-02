@@ -114,9 +114,80 @@ if rank == 0:
 
 dist.barrier()
 
+# ═══════════════════════════════════════════════════════════════════════
+# IMAGE TEST: Run vision encoder + merged generate
+# ═══════════════════════════════════════════════════════════════════════
+if rank == 0:
+    print("\n" + "=" * 60)
+    print("  IMAGE TEST: Vision encoder + decoder generate")
+    print("=" * 60)
+
+from PIL import Image
+from io import BytesIO
+import urllib.request
+from vision import get_vision_embeddings, merge_vision_embeddings
+
+IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+if rank == 0:
+    print(f"  Downloading image...")
+with urllib.request.urlopen(IMAGE_URL) as response:
+    image_data = response.read()
+image = Image.open(BytesIO(image_data)).convert("RGB")
+
+messages = [{"role": "user", "content": [
+    {"type": "image", "image": image},
+    {"type": "text", "text": "Describe this image."},
+]}]
+
+text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = processor(text=[text_prompt], images=[image], return_tensors="pt")
+
+input_ids = inputs["input_ids"].to(NEURON_DEVICE)
+pixel_values = inputs.get("pixel_values")
+image_grid_thw = inputs.get("image_grid_thw")
+
+if pixel_values is not None:
+    pixel_values = pixel_values.to(NEURON_DEVICE)
+if image_grid_thw is not None:
+    image_grid_thw = image_grid_thw.to(NEURON_DEVICE)
+
+if rank == 0:
+    print(f"  Input seq_len={input_ids.shape[-1]}")
+    print(f"  pixel_values shape={pixel_values.shape if pixel_values is not None else None}")
+    print(f"  image_grid_thw={image_grid_thw}")
+
+# Run vision encoder (eager)
+if rank == 0:
+    print(f"  Running vision encoder...")
+    t0 = time.time()
+
+image_embeds, _ = get_vision_embeddings(hf_model, pixel_values, image_grid_thw)
+
+if rank == 0:
+    vis_time = time.time() - t0
+    print(f"  Vision encoder: {vis_time:.2f}s")
+    if image_embeds is not None:
+        print(f"  image_embeds shape={image_embeds.shape}")
+
+# Merge vision embeddings into text
+inputs_embeds = merge_vision_embeddings(decoder.embed_tokens, input_ids, image_embeds=image_embeds)
+
+if rank == 0:
+    print(f"  Merged inputs_embeds shape={inputs_embeds.shape}")
+    print(f"  Generating with vision (max_new_tokens=30)...")
+    t0 = time.time()
+
+generated_tokens = decoder.generate_with_embeds(inputs_embeds, max_new_tokens=30)
+
+if rank == 0:
+    img_time = time.time() - t0
+    text = processor.decode(generated_tokens, skip_special_tokens=True)
+    print(f"  Image generate: {img_time:.1f}s ({30/img_time:.2f} tok/s)")
+    print(f"  Generated: {text[:300]}")
+
 dist.barrier()
+
 if rank == 0:
     print("\n[DONE] Profiling complete. Exiting.")
-# All ranks must exit together; os._exit avoids SIGABRT from Neuron cleanup
 import os as _os
 _os._exit(0)

@@ -100,7 +100,7 @@ spec:
             - name: QWEN3_VL_MAX_NEW_TOKENS
               value: "256"
             - name: MAX_SEQ_LEN
-              value: "128"
+              value: "2048"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
