@@ -173,6 +173,67 @@ if rank == 0:
 
 dist.barrier()
 
+# ═══════════════════════════════════════════════════════════════════════
+# VIDEO TEST
+# ═══════════════════════════════════════════════════════════════════════
+if rank == 0:
+    print("\n" + "=" * 60)
+    print("  VIDEO TEST: Vision encoder + decoder generate")
+    print("=" * 60)
+
+VIDEO_URL = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-VL/space_woaudio.mp4"
+VIDEO_PATH = "/tmp/sample_video.mp4"
+VIDEO_INPUTS_PATH = "/tmp/video_inputs.pt"
+
+if rank == 0:
+    print(f"  Downloading video...")
+    urllib.request.urlretrieve(VIDEO_URL, VIDEO_PATH)
+    from qwen_vl_utils import process_vision_info
+
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video": VIDEO_PATH, "nframes": int(os.environ.get("QWEN3_VL_MAX_NFRAMES", "4"))},
+        {"type": "text", "text": "Describe what is happening in this video."},
+    ]}]
+
+    text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    vid_inputs = processor(text=[text_prompt], images=image_inputs, videos=video_inputs, return_tensors="pt")
+    torch.save(vid_inputs, VIDEO_INPUTS_PATH)
+    print(f"  Video processed")
+
+dist.barrier()
+
+vid_inputs = torch.load(VIDEO_INPUTS_PATH, weights_only=False)
+
+if rank == 0:
+    print(f"  Video seq_len={vid_inputs['input_ids'].shape[-1]}")
+    print(f"  Running vision encoder + merge...")
+    t0 = time.time()
+
+vid_embeds, vid_deepstack, vid_visual_mask = prepare_vision_embeds(hf_model, processor, vid_inputs, NEURON_DEVICE)
+
+if rank == 0:
+    vis_time = time.time() - t0
+    print(f"  Vision + merge: {vis_time:.2f}s")
+    print(f"  vid_embeds shape={vid_embeds.shape}")
+    print(f"  deepstack: {len(vid_deepstack) if vid_deepstack else 0} levels")
+    print(f"  visual_mask: {vid_visual_mask.sum().item() if vid_visual_mask is not None else 0} positions")
+    print(f"  Generating with video + deepstack (max_new_tokens=30)...")
+    t0 = time.time()
+
+generated_tokens = decoder.generate_with_embeds(
+    vid_embeds, max_new_tokens=30,
+    deepstack_embeds=vid_deepstack, visual_mask=vid_visual_mask
+)
+
+if rank == 0:
+    vid_time = time.time() - t0
+    text = processor.decode(generated_tokens, skip_special_tokens=True)
+    print(f"  Video generate: {vid_time:.1f}s ({30/vid_time:.2f} tok/s)")
+    print(f"  Generated: {text[:300]}")
+
+dist.barrier()
+
 if rank == 0:
     print("\n[DONE] Profiling complete. Exiting.")
 import os as _os
