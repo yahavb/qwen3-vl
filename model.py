@@ -170,28 +170,34 @@ class Qwen3VLDecoder:
         k_cache[:, :, start_pos:start_pos+seq_len, :] = k
         v_cache[:, :, start_pos:start_pos+seq_len, :] = v
 
-        # Attention (eager) — slice to valid range
+        # Attention — use full static buffer with masking for fixed shapes
+        # This avoids Neuron eager re-dispatch for each new KV length
         valid_len = start_pos + seq_len
-        k_full = k_cache[:, :, :valid_len, :]
-        v_full = v_cache[:, :, :valid_len, :]
+        k_full = k_cache  # [bsz, kv_heads, max_seq_len, head_dim]
+        v_full = v_cache
 
-        # GQA: expand KV heads to match Q heads (expand+reshape, no repeat_interleave)
+        # GQA: expand KV heads to match Q heads
         if self.num_kv_heads < self.num_q_heads:
             repeat = self.num_q_heads // self.num_kv_heads
-            k_full = k_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, valid_len, self.head_dim)
-            v_full = v_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, valid_len, self.head_dim)
+            k_full = k_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, self.max_seq_len, self.head_dim)
+            v_full = v_full.unsqueeze(2).expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_q_heads, self.max_seq_len, self.head_dim)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
 
-        # Causal mask for prefill only (decode attends to all past, which is correct)
+        # Mask: -inf for all positions >= valid_len (not yet written)
+        # Build mask on CPU then move (avoids Neuron dispatch for mask construction)
+        attn_mask = torch.zeros(1, 1, seq_len, self.max_seq_len, dtype=torch.bfloat16, device=self.device)
+        attn_mask[:, :, :, valid_len:] = float('-inf')
+        # Causal mask for prefill
         if seq_len > 1:
             causal = torch.triu(
-                torch.full((seq_len, valid_len), float('-inf'), device=self.device, dtype=torch.bfloat16),
+                torch.full((seq_len, valid_len), float('-inf'), dtype=torch.bfloat16, device=self.device),
                 diagonal=start_pos + 1
             )
-            attn_weights = attn_weights + causal.unsqueeze(0).unsqueeze(0)
+            attn_mask[:, :, :, :valid_len] = causal
 
+        attn_weights = attn_weights + attn_mask
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(hidden.dtype)
         attn_out = torch.matmul(attn_weights, v_full)
 
