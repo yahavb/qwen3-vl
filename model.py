@@ -122,13 +122,12 @@ class Qwen3VLDecoder:
         self.kv_dim = num_kv_heads * head_dim
 
     def init_kv_cache(self, batch_size=1):
-        """Allocate static KV cache — stored at Q head count (pre-expanded for GQA)."""
+        """Allocate static KV cache at KV head count."""
         cache = []
         for _ in range(self.num_layers):
-            # Store at num_q_heads (not num_kv_heads) to avoid repeat_interleave at runtime
-            k = torch.zeros(batch_size, self.num_q_heads, self.max_seq_len, self.head_dim,
+            k = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
                           dtype=torch.bfloat16, device=self.device)
-            v = torch.zeros(batch_size, self.num_q_heads, self.max_seq_len, self.head_dim,
+            v = torch.zeros(batch_size, self.num_kv_heads, self.max_seq_len, self.head_dim,
                           dtype=torch.bfloat16, device=self.device)
             cache.append((k, v))
         return cache
@@ -153,13 +152,7 @@ class Qwen3VLDecoder:
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # GQA expand K/V at write time (avoid repeat_interleave at attention time)
-        if self.num_kv_heads < self.num_q_heads:
-            repeat = self.num_q_heads // self.num_kv_heads
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
-
-        # KV cache update (eager, in-place) — cache is stored at num_q_heads
+        # KV cache update (eager, in-place)
         k_cache, v_cache = kv_cache[layer_idx]
         k_cache[:, :, start_pos:start_pos+seq_len, :] = k
         v_cache[:, :, start_pos:start_pos+seq_len, :] = v
@@ -168,6 +161,12 @@ class Qwen3VLDecoder:
         valid_len = start_pos + seq_len
         k_full = k_cache[:, :, :valid_len, :]
         v_full = v_cache[:, :, :valid_len, :]
+
+        # GQA: expand KV heads to match Q heads
+        if self.num_kv_heads < self.num_q_heads:
+            repeat = self.num_q_heads // self.num_kv_heads
+            k_full = k_full.repeat_interleave(repeat, dim=1)
+            v_full = v_full.repeat_interleave(repeat, dim=1)
 
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k_full.transpose(-2, -1)) * scale
@@ -267,7 +266,7 @@ class Qwen3VLDecoder:
             logits = self.decode_step(next_token, pos, kv_cache)
             next_token = logits[:, -1, :].argmax(dim=-1)
             tok = next_token.item()
-            if verbose and dist.get_rank() == 0 and i < 5:
+            if verbose and dist.get_rank() == 0 and (i < 10 or i % 10 == 0):
                 print(f"    decode[{i}]: {_time.time()-t0:.2f}s tok={tok}")
             if tok == eos_token_id:
                 break
