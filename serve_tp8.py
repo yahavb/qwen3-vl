@@ -101,10 +101,10 @@ dist.barrier()
 
 # Longer generation
 if rank == 0:
-    print(f"\n  Running 50 tokens (cached)...")
+    print(f"\n  Running 50 tokens (verbose, first 5 decode steps timed)...")
     t0 = time.time()
 
-generated_tokens = decoder.generate(input_ids, max_new_tokens=50)
+generated_tokens = decoder.generate(input_ids, max_new_tokens=50, verbose=True)
 
 if rank == 0:
     t50 = time.time() - t0

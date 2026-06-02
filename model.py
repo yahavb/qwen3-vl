@@ -241,27 +241,34 @@ class Qwen3VLDecoder:
         return self.forward(input_ids, start_pos=pos, kv_cache=kv_cache)
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens=256, eos_token_id=151645):
+    def generate(self, input_ids, max_new_tokens=256, eos_token_id=151645, verbose=False):
         """Custom generate loop with static decode shape.
 
         1. Prefill: process full prompt (compiles for prefill bucket)
         2. Decode: one token at a time with seq_len=1 (compiles once, reuses)
         """
+        import time as _time
         bsz, prompt_len = input_ids.shape
         kv_cache = self.init_kv_cache(batch_size=bsz)
 
         # Prefill
+        t0 = _time.time()
         logits = self.prefill(input_ids, kv_cache)
         next_token = logits[:, -1, :].argmax(dim=-1)
+        if verbose and dist.get_rank() == 0:
+            print(f"    prefill: {_time.time()-t0:.2f}s")
 
         generated_tokens = [next_token.item()]
 
         # Decode loop — always seq_len=1, same compiled NEFF reused
         for i in range(max_new_tokens - 1):
             pos = prompt_len + i
+            t0 = _time.time()
             logits = self.decode_step(next_token, pos, kv_cache)
             next_token = logits[:, -1, :].argmax(dim=-1)
             tok = next_token.item()
+            if verbose and dist.get_rank() == 0 and i < 5:
+                print(f"    decode[{i}]: {_time.time()-t0:.2f}s tok={tok}")
             if tok == eos_token_id:
                 break
             generated_tokens.append(tok)
