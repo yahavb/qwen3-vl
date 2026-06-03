@@ -55,6 +55,53 @@ def check_close(name, nki_out, ref_out, rtol=1e-2, atol=1e-2):
 # ═══════════════════════════════════════════════════════════════════════
 # TEST 1: RoPE kernel
 # ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# TEST 0: nc_matmul semantics — determine if it's A@B or A^T@B
+# ═══════════════════════════════════════════════════════════════════════
+print("=" * 60)
+print("TEST 0: nc_matmul semantics")
+print("=" * 60)
+
+import nki
+import nki.language as nl
+import nki.isa as nisa
+
+@nki.jit
+def test_matmul(a, b):
+    P = 128
+    out = nl.ndarray((P, P), dtype=a.dtype, buffer=nl.shared_hbm)
+    a_sb = nl.ndarray((P, P), dtype=a.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=a_sb, src=a)
+    b_sb = nl.ndarray((P, P), dtype=b.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=b_sb, src=b)
+    out_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(out_psum, a_sb, b_sb)
+    result = nl.copy(out_psum, dtype=a.dtype)
+    nisa.dma_copy(dst=out, src=result)
+    return out
+
+# Simple test: A = [[1,2],[3,4],...] padded to 128x128, B = identity
+A = torch.zeros(128, 128, dtype=torch.bfloat16)
+A[0, 0] = 1; A[0, 1] = 2; A[1, 0] = 3; A[1, 1] = 4
+B = torch.eye(128, dtype=torch.bfloat16)
+
+matmul_kernel = wrap_nki(test_matmul)
+result = matmul_kernel(A.to(DEVICE), B.to(DEVICE)).cpu()
+
+print(f"  A[0:2, 0:2] = [[1,2],[3,4]]")
+print(f"  B = identity")
+print(f"  nc_matmul(A, B)[0:2, 0:2] = {result[0:2, 0:2].float().numpy()}")
+print(f"  If A@B:   expect [[1,2],[3,4]]")
+print(f"  If A^T@B: expect [[1,3],[2,4]]")
+
+if result[0, 1].item() == 2.0:
+    print(f"  => nc_matmul = A @ B (no transpose)")
+elif result[0, 1].item() == 3.0:
+    print(f"  => nc_matmul = A^T @ B (transposes stationary)")
+else:
+    print(f"  => UNEXPECTED result")
+
+print()
 print("=" * 60)
 print("TEST 1: RoPE kernel (qwen3_rope)")
 print("=" * 60)
