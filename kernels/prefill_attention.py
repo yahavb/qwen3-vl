@@ -120,25 +120,19 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
                     old_sum = nl.copy(r_sum)
                     r_sum[...] = nl.add(nl.multiply(old_sum, corr), tile_sum)
 
-                    # PV: attn[P_q, P_k] @ V[P_k, D] = [P_q, D]
-                    # nc_matmul: out[P,F] = stat[P,C] @ mov[C,F]
-                    # stat = attn[P_q=P, C=P] — partition=P_q, contract=P_k
-                    # mov = v_tile[P_k=P, D] — contract=P_k, free=D
-                    # BUT: stat partition dim = P_q, and the values in stat are
-                    # arranged as [row=P_q, col=P_k]. nc_matmul contracts along
-                    # the free dim of stat (cols) with partition dim of mov.
-                    # Actually nc_matmul contracts stat's FREE dim with mov's PARTITION dim.
-                    # stat[P, C]: P=partition(128), C=free
-                    # mov[C, F]: C=partition(128), F=free
-                    # Result[P, F]
-                    # So stat=attn[P_q, P_k] has partition=P_q, free=P_k
-                    # mov=v_tile[P_k, D] has partition=P_k, free=D
-                    # Contraction is over P_k (stat free × mov partition) ← CORRECT!
-                    # This gives attn @ V directly — no transpose needed!
+                    # PV: need output[P_q, D] = attn[P_q, P_k] @ V[P_k, D]
+                    # Rolling-forcing pattern: transpose attn via identity, then matmul
+                    # nc_matmul(attn_T[P,P], v[P,D]) where attn_T = attn transposed
                     exp_bf16 = nl.copy(exp_scores, dtype=nl.bfloat16)
+                    exp_T_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(exp_T_psum, exp_bf16, id_sbuf)
+                    exp_T_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+                    exp_T_f32[...] = nl.copy(exp_T_psum, dtype=nl.float32)
+                    exp_T = nl.copy(exp_T_f32, dtype=nl.bfloat16)
+
                     v_tile = v_tiles[:, k_ti, :]
                     pv_psum = nl.ndarray((P, D), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(pv_psum, exp_bf16, v_tile)
+                    nisa.nc_matmul(pv_psum, exp_T, v_tile)
                     pv_tile = nl.ndarray((P, D), dtype=nl.float32, buffer=nl.sbuf)
                     pv_tile[...] = nl.copy(pv_psum, dtype=nl.float32)
 
