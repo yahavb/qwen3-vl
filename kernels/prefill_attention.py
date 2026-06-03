@@ -8,8 +8,8 @@ For Qwen3-VL-8B TP-8:
   - seq_len padded to multiple of 128
 
 IO layouts (all bf16):
-  - q:      (num_q_heads, head_dim, seq_len) — transposed for matmul
-  - k:      (num_kv_heads, head_dim, seq_len) — transposed for matmul
+  - q:      (num_q_heads, seq_len, head_dim) — standard layout
+  - k:      (num_kv_heads, head_dim, seq_len) — transposed for K matmul
   - v:      (num_kv_heads, seq_len, head_dim)
   - mask:   (seq_len, seq_len) — full causal mask: 0 valid, -inf masked
             mask[i, j] = 0 if j <= i, else -inf
@@ -30,7 +30,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
     """Flash causal self-attention for prefill with GQA.
 
     Args:
-        q:        (num_q_heads, D, seq_len) bf16
+        q:        (num_q_heads, seq_len, D) bf16
         k:        (num_kv_heads, D, seq_len) bf16
         v:        (num_kv_heads, seq_len, D) bf16
         identity: (128, 128) bf16
@@ -43,7 +43,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
     Returns:
         out: (num_q_heads, seq_len, D) bf16
     """
-    seq_len = q.shape[2]
+    seq_len = q.shape[1]
     P = nl.tile_size.pmax  # 128
     D = head_dim
     num_tiles = seq_len // P
@@ -73,12 +73,11 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
             q_h = kv_h * gqa_ratio + q_offset
 
             for grp_i in range(num_tiles):
-                # Load Q tile: [D, P]
-                q_tile = nl.ndarray((D, P), dtype=q.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(dst=q_tile, src=q[q_h, :, nl.ds(grp_i * P, P)])
+                # Load Q tile: [P, D] — Q is (heads, seq_len, D)
+                q_tile = nl.ndarray((P, D), dtype=q.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=q_tile, src=q[q_h, nl.ds(grp_i * P, P), :])
 
                 # Load mask rows for this Q group: mask[grp_i*P:(grp_i+1)*P, :]
-                # Full mask is [seq_len, seq_len], load slice [P, seq_len]
                 mask_grp = nl.ndarray((P, seq_len), dtype=nl.float32, buffer=nl.sbuf)
                 for mti in range(num_tiles):
                     mask_tile = nl.ndarray((P, P), dtype=mask.dtype, buffer=nl.sbuf)
@@ -92,19 +91,13 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
 
                 # Tile over K
                 for k_ti in range(num_tiles):
-                    # Score: Q^T[P,D] @ K_slice[D,P] = [P,P]
-                    # Transpose Q via identity: q_tile[D,P] → q_T[P,D]
-                    # Since D==P==128, identity trick works
-                    q_T_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(q_T_psum, q_tile, id_sbuf)
-                    q_T_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
-                    q_T_f32[...] = nl.copy(q_T_psum, dtype=nl.float32)
-                    q_T = nl.copy(q_T_f32, dtype=nl.bfloat16)
-
-                    # Scores = q_T[P,D] @ k_slice[D,P] = [P,P]
+                    # Scores = Q[P,D] @ K_slice[D,P] = [P,P]
+                    # nc_matmul: out[P,F] = stat[P,C] @ mov[C,F]
+                    # stat = q_tile[P, D] (partition=P=128, contract=D=128)
+                    # mov = k_slice[D, P] (contract=D=128, free=P=128)
                     k_slice = k_full[:, nl.ds(k_ti * P, P)]
                     score_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(score_psum, q_T, k_slice)
+                    nisa.nc_matmul(score_psum, q_tile, k_slice)
                     scores = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
                     scores[...] = nl.copy(score_psum, dtype=nl.float32)
                     scores = nl.multiply(scores, softmax_scale)

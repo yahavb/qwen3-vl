@@ -117,8 +117,8 @@ print("\n" + "=" * 60)
 print("TEST 2: Prefill Flash Attention (prefill_gqa_flash_attention)")
 print("=" * 60)
 
-# Generate Q, K, V
-q = torch.randn(NUM_Q_HEADS, HEAD_DIM, SEQ_LEN, dtype=torch.bfloat16)
+# Generate Q, K, V — Q is [heads, seq, D], K is [heads, D, seq], V is [heads, seq, D]
+q = torch.randn(NUM_Q_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16)
 k = torch.randn(NUM_KV_HEADS, HEAD_DIM, SEQ_LEN, dtype=torch.bfloat16)
 v = torch.randn(NUM_KV_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16)
 identity = torch.eye(128, dtype=torch.bfloat16)
@@ -133,16 +133,16 @@ causal_mask = torch.triu(
 # PyTorch reference (causal attention with GQA)
 def attention_ref(q, k, v, scale, num_q_heads, num_kv_heads):
     """Reference causal GQA attention.
-    q: (num_q_heads, D, seq), k: (num_kv_heads, D, seq), v: (num_kv_heads, seq, D)
+    q: (num_q_heads, seq, D), k: (num_kv_heads, D, seq), v: (num_kv_heads, seq, D)
     """
-    seq_len = q.shape[2]
+    seq_len = q.shape[1]
     gqa_ratio = num_q_heads // num_kv_heads
     out = torch.zeros(num_q_heads, seq_len, HEAD_DIM, dtype=torch.bfloat16)
 
     for q_h in range(num_q_heads):
         kv_h = q_h // gqa_ratio
-        # Q: [D, seq] -> [seq, D]
-        q_t = q[q_h].T.float()  # [seq, D]
+        # Q: [seq, D]
+        q_t = q[q_h].float()  # [seq, D]
         # K: [D, seq] -> [seq, D]
         k_t = k[kv_h].T.float()  # [seq, D]
         # V: [seq, D]
