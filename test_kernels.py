@@ -189,6 +189,14 @@ print(f"  NKI time: {t1-t0:.3f}s (includes compilation)")
 nki_attn_out_cpu = nki_attn_out.cpu()
 attn_pass = check_close("Prefill Attention", nki_attn_out_cpu, ref_attn_out)
 
+# Per-tile diff analysis
+nki_np = nki_attn_out_cpu.float().numpy()
+ref_np = ref_attn_out.float().numpy()
+for tile_i in range(SEQ_LEN // 128):
+    s, e = tile_i * 128, (tile_i + 1) * 128
+    tile_diff = np.abs(nki_np[:, s:e, :] - ref_np[:, s:e, :]).max()
+    print(f"    Tile {tile_i} (pos {s}-{e-1}): max_diff={tile_diff:.6f}")
+
 # Run again (cached)
 t0 = time.time()
 nki_attn_out2 = prefill_kernel(q_dev, k_dev, v_dev, id_dev, mask_dev, scale,
