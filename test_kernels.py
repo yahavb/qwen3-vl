@@ -197,6 +197,12 @@ for tile_i in range(SEQ_LEN // 128):
     tile_diff = np.abs(nki_np[:, s:e, :] - ref_np[:, s:e, :]).max()
     print(f"    Tile {tile_i} (pos {s}-{e-1}): max_diff={tile_diff:.6f}")
 
+# Diagnostic: check which ROWS have largest error (head 0, tile 0)
+row_diffs = np.abs(nki_np[0, :128, :] - ref_np[0, :128, :]).max(axis=1)
+worst_rows = np.argsort(row_diffs)[-5:]
+print(f"    Worst rows in head0/tile0: {worst_rows} with diffs: {row_diffs[worst_rows]}")
+print(f"    Best rows in head0/tile0: rows 0-4 diffs: {row_diffs[:5]}")
+
 # Run again (cached)
 t0 = time.time()
 nki_attn_out2 = prefill_kernel(q_dev, k_dev, v_dev, id_dev, mask_dev, scale,
