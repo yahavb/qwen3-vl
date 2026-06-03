@@ -8,8 +8,8 @@ For Qwen3-VL-8B TP-8:
   - seq_len padded to multiple of 128
 
 IO layouts (all bf16):
-  - q:      (num_q_heads, seq_len, head_dim) — standard layout
-  - k:      (num_kv_heads, head_dim, seq_len) — transposed for K matmul
+  - q:      (num_q_heads, head_dim, seq_len) — transposed (D as partition dim)
+  - k:      (num_kv_heads, head_dim, seq_len) — transposed (D as partition dim)
   - v:      (num_kv_heads, seq_len, head_dim)
   - mask:   (seq_len, seq_len) — full causal mask: 0 valid, -inf masked
             mask[i, j] = 0 if j <= i, else -inf
@@ -30,7 +30,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
     """Flash causal self-attention for prefill with GQA.
 
     Args:
-        q:        (num_q_heads, seq_len, D) bf16
+        q:        (num_q_heads, D, seq_len) bf16
         k:        (num_kv_heads, D, seq_len) bf16
         v:        (num_kv_heads, seq_len, D) bf16
         identity: (128, 128) bf16
@@ -43,7 +43,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
     Returns:
         out: (num_q_heads, seq_len, D) bf16
     """
-    seq_len = q.shape[1]
+    seq_len = q.shape[2]
     P = nl.tile_size.pmax  # 128
     D = head_dim
     num_tiles = seq_len // P
@@ -73,9 +73,9 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
             q_h = kv_h * gqa_ratio + q_offset
 
             for grp_i in range(num_tiles):
-                # Load Q tile: [P, D] — Q is (heads, seq_len, D)
-                q_tile = nl.ndarray((P, D), dtype=q.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(dst=q_tile, src=q[q_h, nl.ds(grp_i * P, P), :])
+                # Load Q tile: [D, P] — Q is (heads, D, seq_len)
+                q_tile = nl.ndarray((D, P), dtype=q.dtype, buffer=nl.sbuf)
+                nisa.dma_copy(dst=q_tile, src=q[q_h, :, nl.ds(grp_i * P, P)])
 
                 # Load mask rows for this Q group: mask[grp_i*P:(grp_i+1)*P, :]
                 mask_grp = nl.ndarray((P, seq_len), dtype=nl.float32, buffer=nl.sbuf)
