@@ -89,8 +89,8 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
                 r_sum = nl.zeros((P, 1), dtype=nl.float32)
                 pv_acc = nl.zeros((P, D), dtype=nl.float32)
 
-                # Tile over K
-                for k_ti in range(num_tiles):
+                # Tile over K — only up to grp_i+1 (causal: can't attend beyond)
+                for k_ti in range(grp_i + 1):
                     # Scores = Q[P,D] @ K_slice[D,P] = [P,P]
                     # nc_matmul: out[P,F] = stat[P,C] @ mov[C,F]
                     # stat = q_tile[P, D] (partition=P=128, contract=D=128)
