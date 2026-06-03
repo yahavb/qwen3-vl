@@ -124,6 +124,15 @@ v = torch.randn(NUM_KV_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16)
 identity = torch.eye(128, dtype=torch.bfloat16)
 scale = 1.0 / math.sqrt(HEAD_DIM)
 
+# Build causal mask [128, seq_len]: for each row r, column c is -inf if c > r
+# This is a simplified version — full version would shift per Q-tile group
+# For the test with a single Q tile group starting at position 0:
+causal_mask = torch.zeros(128, SEQ_LEN, dtype=torch.bfloat16)
+for r in range(128):
+    for c in range(SEQ_LEN):
+        if c > r:
+            causal_mask[r, c] = float('-inf')
+
 # PyTorch reference (causal attention with GQA)
 def attention_ref(q, k, v, scale, num_q_heads, num_kv_heads):
     """Reference causal GQA attention.
@@ -167,12 +176,13 @@ q_dev = q.to(DEVICE)
 k_dev = k.to(DEVICE)
 v_dev = v.to(DEVICE)
 id_dev = identity.to(DEVICE)
+mask_dev = causal_mask.to(DEVICE)
 
 print(f"  Running NKI kernel...")
 t0 = time.time()
 
 prefill_kernel = wrap_nki(prefill_gqa_flash_attention)
-nki_attn_out = prefill_kernel(q_dev, k_dev, v_dev, id_dev, scale,
+nki_attn_out = prefill_kernel(q_dev, k_dev, v_dev, id_dev, mask_dev, scale,
                                num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
                                head_dim=HEAD_DIM)
 
@@ -184,7 +194,7 @@ attn_pass = check_close("Prefill Attention", nki_attn_out_cpu, ref_attn_out)
 
 # Run again (cached)
 t0 = time.time()
-nki_attn_out2 = prefill_kernel(q_dev, k_dev, v_dev, id_dev, scale,
+nki_attn_out2 = prefill_kernel(q_dev, k_dev, v_dev, id_dev, mask_dev, scale,
                                 num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
                                 head_dim=HEAD_DIM)
 t1 = time.time()
