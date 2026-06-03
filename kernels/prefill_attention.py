@@ -11,9 +11,8 @@ IO layouts (all bf16):
   - q:      (num_q_heads, head_dim, seq_len) — transposed for matmul
   - k:      (num_kv_heads, head_dim, seq_len) — transposed for matmul
   - v:      (num_kv_heads, seq_len, head_dim)
-  - mask:   (128, seq_len) — causal mask: 0 valid, -inf masked
-            Row r masks for query position r (within a P=128 tile).
-            Caller builds full causal mask and passes per Q-tile slice.
+  - mask:   (seq_len, seq_len) — full causal mask: 0 valid, -inf masked
+            mask[i, j] = 0 if j <= i, else -inf
   - identity: (128, 128) — for transpose trick
   - out:    (num_q_heads, seq_len, head_dim)
 
@@ -35,7 +34,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
         k:        (num_kv_heads, D, seq_len) bf16
         v:        (num_kv_heads, seq_len, D) bf16
         identity: (128, 128) bf16
-        mask:     (128, seq_len) bf16 — causal mask (0 valid, -inf future)
+        mask:     (seq_len, seq_len) bf16 — full causal mask (0 valid, -inf future)
         softmax_scale: float
         num_q_heads: int
         num_kv_heads: int
@@ -69,12 +68,6 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
             nisa.dma_copy(dst=v_tiles[:, ti, :],
                           src=v[kv_h, nl.ds(ti * P, P), :])
 
-        # Load mask: [P, seq_len] — shared across Q heads
-        mask_buf = nl.ndarray((P, seq_len), dtype=nl.float32, buffer=nl.sbuf)
-        for ti in range(num_tiles):
-            mask_tile = nl.ndarray((P, P), dtype=mask.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=mask_tile, src=mask[:, nl.ds(ti * P, P)])
-            mask_buf[:, nl.ds(ti * P, P)] = nl.copy(mask_tile, dtype=nl.float32)
 
         for q_offset in range(gqa_ratio):
             q_h = kv_h * gqa_ratio + q_offset
@@ -84,6 +77,14 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
                 q_tile = nl.ndarray((D, P), dtype=q.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=q_tile, src=q[q_h, :, nl.ds(grp_i * P, P)])
 
+                # Load mask rows for this Q group: mask[grp_i*P:(grp_i+1)*P, :]
+                # Full mask is [seq_len, seq_len], load slice [P, seq_len]
+                mask_grp = nl.ndarray((P, seq_len), dtype=nl.float32, buffer=nl.sbuf)
+                for mti in range(num_tiles):
+                    mask_tile = nl.ndarray((P, P), dtype=mask.dtype, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=mask_tile, src=mask[nl.ds(grp_i * P, P), nl.ds(mti * P, P)])
+                    mask_grp[:, nl.ds(mti * P, P)] = nl.copy(mask_tile, dtype=nl.float32)
+
                 # Online softmax state
                 r_max = nl.full((P, 1), fill_value=float('-inf'), dtype=nl.float32)
                 r_sum = nl.zeros((P, 1), dtype=nl.float32)
@@ -92,7 +93,7 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
                 # Tile over K
                 for k_ti in range(num_tiles):
                     # Score: Q^T[P,D] @ K_slice[D,P] = [P,P]
-                    # First transpose Q via identity: q_tile[D,P] → q_T[P,D]
+                    # Transpose Q via identity: q_tile[D,P] → q_T[P,D]
                     # Since D==P==128, identity trick works
                     q_T_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_matmul(q_T_psum, q_tile, id_sbuf)
@@ -108,12 +109,8 @@ def prefill_gqa_flash_attention(q, k, v, identity, mask, softmax_scale,
                     scores[...] = nl.copy(score_psum, dtype=nl.float32)
                     scores = nl.multiply(scores, softmax_scale)
 
-                    # Add causal mask for this (grp_i, k_ti) pair
-                    # mask_buf row r masks query position grp_i*P+r
-                    # Column k_ti*P+c: should be -inf if k_ti*P+c > grp_i*P+r
-                    # The caller pre-builds this into mask_buf
-                    # For now: use mask_buf[:, k_ti*P : (k_ti+1)*P]
-                    mask_slice = mask_buf[:, nl.ds(k_ti * P, P)]
+                    # Add causal mask slice for this K tile
+                    mask_slice = mask_grp[:, nl.ds(k_ti * P, P)]
                     scores = nl.add(scores, mask_slice)
 
                     # Online softmax

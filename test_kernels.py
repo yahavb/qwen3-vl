@@ -124,14 +124,11 @@ v = torch.randn(NUM_KV_HEADS, SEQ_LEN, HEAD_DIM, dtype=torch.bfloat16)
 identity = torch.eye(128, dtype=torch.bfloat16)
 scale = 1.0 / math.sqrt(HEAD_DIM)
 
-# Build causal mask [128, seq_len]: for each row r, column c is -inf if c > r
-# This is a simplified version — full version would shift per Q-tile group
-# For the test with a single Q tile group starting at position 0:
-causal_mask = torch.zeros(128, SEQ_LEN, dtype=torch.bfloat16)
-for r in range(128):
-    for c in range(SEQ_LEN):
-        if c > r:
-            causal_mask[r, c] = float('-inf')
+# Build full causal mask [seq_len, seq_len]: mask[i, j] = -inf if j > i
+causal_mask = torch.triu(
+    torch.full((SEQ_LEN, SEQ_LEN), float('-inf'), dtype=torch.bfloat16),
+    diagonal=1
+)
 
 # PyTorch reference (causal attention with GQA)
 def attention_ref(q, k, v, scale, num_q_heads, num_kv_heads):
