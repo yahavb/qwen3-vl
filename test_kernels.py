@@ -76,8 +76,11 @@ def test_matmul(a, b):
     nisa.dma_copy(dst=b_sb, src=b)
     out_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(out_psum, a_sb, b_sb)
-    result = nl.copy(out_psum, dtype=a.dtype)
-    nisa.dma_copy(dst=out, src=result)
+    # PSUM -> SBUF f32 -> SBUF bf16 -> HBM
+    out_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    out_f32[...] = nl.copy(out_psum, dtype=nl.float32)
+    out_bf16 = nl.copy(out_f32, dtype=a.dtype)
+    nisa.dma_copy(dst=out, src=out_bf16)
     return out
 
 # Simple test: A = [[1,2],[3,4],...] padded to 128x128, B = identity
