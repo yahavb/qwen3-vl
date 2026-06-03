@@ -64,10 +64,9 @@ spec:
 
               echo "Model weights ready at $MODEL_LOCAL"
 
-              # ─── Test NKI kernels (single core, no TP) ─────────────────────
-              echo "Testing NKI kernels..."
-              cd /tmp/qwen3-vl
-              NEURON_RT_NUM_CORES=1 python test_kernels.py
+              # ─── Run full model profiling (TP-8) ─────────────────────────
+              echo "Launching TP-8 profiling (text + image + video)..."
+              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_tp8.py
           resources:
             claims:
               - name: s-lnc1-trn2
