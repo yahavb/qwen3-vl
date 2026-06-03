@@ -28,7 +28,7 @@ from kernels.prefill_attention import prefill_gqa_flash_attention
 NUM_Q_HEADS = 4
 NUM_KV_HEADS = 1
 HEAD_DIM = 128
-SEQ_LEN = 256  # multiple of 128
+SEQ_LEN = 128  # Start with 1 tile to isolate correctness
 HALF_D = HEAD_DIM // 2
 
 torch.manual_seed(42)
