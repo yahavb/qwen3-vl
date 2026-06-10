@@ -1,0 +1,115 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen3-vl-fused
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: qwen3-vl-fused
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              # Install dependencies
+              uv pip install transformers qwen-vl-utils accelerate Pillow av
+              uv pip install fastapi uvicorn python-multipart
+              uv pip install "setuptools<81"
+              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # ─── Clone serve script from GitHub ──────────────────────────────
+              git clone -b fused-layer-compile https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
+
+              # ─── Model caching ───────────────────────────────────────────────
+              MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
+              MODEL_LOCAL="/tmp/Qwen3-VL-8B-Instruct"
+              MODEL_TAR="/var/mdl/qwen3_vl/Qwen3-VL-8B-Instruct.tar"
+
+              if [[ -f "$MODEL_TAR" ]]; then
+                echo "Copying model tar from S3 cache..."
+                mkdir -p /tmp
+                cp "$MODEL_TAR" /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Extracting..."
+                tar xf /tmp/Qwen3-VL-8B-Instruct.tar -C /tmp/
+                rm -f /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Model extracted to $MODEL_LOCAL"
+              else
+                echo "Downloading model from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('${MODEL_ID}', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
+              "
+                echo "Creating tar archive for S3 cache..."
+                tar cf /tmp/Qwen3-VL-8B-Instruct.tar -C /tmp Qwen3-VL-8B-Instruct
+                mkdir -p "$(dirname $MODEL_TAR)"
+                cp /tmp/Qwen3-VL-8B-Instruct.tar "$MODEL_TAR"
+                rm -f /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Cached tar to S3!"
+              fi
+
+              echo "Model weights ready at $MODEL_LOCAL"
+
+              # ─── Run fused model profiling (TP-8) ─────────────────────────
+              echo "Launching TP-8 FUSED profiling (text + image + video)..."
+              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_tp8_fused.py
+          resources:
+            claims:
+              - name: s-lnc1-trn2
+            requests:
+              cpu: 44
+              memory: 440Gi
+            limits:
+              cpu: 44
+              memory: 440Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
+              value: "0"
+            - name: QWEN3_VL_MAX_NFRAMES
+              value: "4"
+            - name: QWEN3_VL_MAX_NEW_TOKENS
+              value: "256"
+            - name: MAX_SEQ_LEN
+              value: "2048"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
