@@ -33,7 +33,7 @@ spec:
               uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
 
               # ─── Clone serve script from GitHub ──────────────────────────────
-              git clone -b tp8-submodule-compile https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
+              git clone -b main https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
 
               # ─── Model caching ───────────────────────────────────────────────
               MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
