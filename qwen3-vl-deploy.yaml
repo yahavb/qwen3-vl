@@ -48,7 +48,7 @@ spec:
               uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
 
               # ─── Clone serve script from GitHub ──────────────────────────────
-              git clone -b tp8-submodule-compile https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
+              git clone -b fused-layer-compile https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
 
               # ─── Model caching ───────────────────────────────────────────────
               MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
@@ -80,7 +80,7 @@ spec:
 
               # ─── Launch TP-8 server ──────────────────────────────────────────
               echo "Launching TP-8 serving..."
-              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_deploy.py
+              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_deploy_fused.py
           resources:
             claims:
               - name: s-lnc1-trn2
