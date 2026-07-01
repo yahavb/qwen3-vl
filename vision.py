@@ -81,42 +81,56 @@ def prepare_vision_embeds(hf_model, processor, inputs, device):
         video_mask = (input_ids[0] == VIDEO_TOKEN_ID)
         num_video_positions = video_mask.sum().item()
 
-        if num_video_positions > 0 and video_features.shape[0] >= num_video_positions:
-            inputs_embeds[0, video_mask] = video_features[:num_video_positions].to(inputs_embeds.dtype)
-            visual_mask = visual_mask | video_mask
+        # On Neuron the vision path is a static-shape compiled graph, so
+        # video_features.shape[0] is fixed (e.g. 1152) regardless of the clip's
+        # real grid, while num_video_positions tracks the processor's per-clip
+        # <video> placeholder count (e.g. 683/692). When they differ, decode
+        # crashes: model_fused adds deepstack rows onto hidden[0, visual_mask],
+        # so deepstack rows MUST equal visual_mask positions. We therefore fill
+        # exactly n = min(features, placeholders) positions and truncate the
+        # main features AND the deepstack to that same n, keeping every count
+        # consistent. If features < placeholders, the surplus placeholders stay
+        # as text embeds (not marked visual); if features > placeholders, the
+        # extra features are dropped.
+        n_fill = min(int(video_features.shape[0]), int(num_video_positions))
+        if n_fill > 0:
+            vid_pos = video_mask.nonzero(as_tuple=True)[0][:n_fill]
+            fill_mask = torch.zeros_like(video_mask)
+            fill_mask[vid_pos] = True
+            inputs_embeds[0, fill_mask] = video_features[:n_fill].to(inputs_embeds.dtype)
+            visual_mask = visual_mask | fill_mask
 
-            # Merge deepstack: if we already have image deepstack, combine
+            # Deepstack for the video positions, truncated to the SAME n_fill so
+            # deepstack row count == visual_mask positions at decode time.
             if video_deepstack:
                 if all_deepstack:
-                    # Combine image + video deepstack at their respective positions
+                    # Image + video in one request: rebuild each deepstack level
+                    # sized to the full visual_mask, scattering image rows into
+                    # image positions and video rows into the filled video ones.
+                    vis_positions = visual_mask.nonzero(as_tuple=True)[0]
+                    img_positions = (input_ids[0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
                     for idx in range(len(video_deepstack)):
                         combined = torch.zeros(
-                            visual_mask.sum().item(), video_deepstack[idx].shape[-1],
+                            vis_positions.shape[0], video_deepstack[idx].shape[-1],
                             dtype=inputs_embeds.dtype, device=device
                         )
-                        # Map visual_mask positions back to image/video
-                        vis_positions = visual_mask.nonzero(as_tuple=True)[0]
-                        img_positions = (input_ids[0] == IMAGE_TOKEN_ID).nonzero(as_tuple=True)[0]
-                        vid_positions = (input_ids[0] == VIDEO_TOKEN_ID).nonzero(as_tuple=True)[0]
-
-                        # Scatter image deepstack
-                        for j, pos in enumerate(img_positions):
-                            idx_in_vis = (vis_positions == pos).nonzero(as_tuple=True)[0]
-                            if len(idx_in_vis) > 0 and j < all_deepstack[idx].shape[0]:
-                                combined[idx_in_vis[0]] = all_deepstack[idx][j]
-                        # Scatter video deepstack
-                        for j, pos in enumerate(vid_positions):
-                            idx_in_vis = (vis_positions == pos).nonzero(as_tuple=True)[0]
-                            if len(idx_in_vis) > 0 and j < video_deepstack[idx].shape[0]:
-                                combined[idx_in_vis[0]] = video_deepstack[idx][j]
-
+                        pos_to_row = {int(p): r for r, p in enumerate(vis_positions.tolist())}
+                        for j, pos in enumerate(img_positions.tolist()):
+                            r = pos_to_row.get(pos)
+                            if r is not None and idx < len(all_deepstack) and j < all_deepstack[idx].shape[0]:
+                                combined[r] = all_deepstack[idx][j]
+                        for j, pos in enumerate(vid_pos.tolist()):
+                            r = pos_to_row.get(pos)
+                            if r is not None and j < video_deepstack[idx].shape[0]:
+                                combined[r] = video_deepstack[idx][j].to(inputs_embeds.dtype)
                         if idx < len(all_deepstack):
                             all_deepstack[idx] = combined
                         else:
                             all_deepstack.append(combined)
                 else:
+                    # Video only (the captioning case): truncate to n_fill.
                     all_deepstack = [
-                        ds[:num_video_positions].to(inputs_embeds.dtype)
+                        ds[:n_fill].to(inputs_embeds.dtype)
                         for ds in video_deepstack
                     ]
 

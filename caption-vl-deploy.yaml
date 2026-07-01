@@ -1,0 +1,168 @@
+# Dedicated Qwen3-VL endpoint for Kinetics CAPTIONING.
+#
+# Separate from the existing `qwen3-vl` Service/Deployment (which stays
+# untouched and serves eval). This one:
+#   * has its own Service name `caption-qwen3-vl` (svc DNS:
+#     caption-qwen3-vl.default.svc.cluster.local:8000)
+#   * clones the `caption-endpoint` branch, which carries the vision.py fix for
+#     the video deepstack / visual-mask size mismatch (the 683-vs-1152 crash).
+#   * can be scaled independently (cores/memory to be tuned later).
+#
+# NOTE: still TP-8 (serve_deploy_fused.py asserts world_size == 8). Changing
+# resources = bigger device-memory claim -> larger MAX_SEQ_LEN recompile,
+# NOT more tensor-parallel ranks.
+apiVersion: v1
+kind: Service
+metadata:
+  name: caption-qwen3-vl
+  namespace: default
+spec:
+  selector:
+    app: caption-qwen3-vl
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caption-qwen3-vl
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: caption-qwen3-vl
+  template:
+    metadata:
+      labels:
+        app: caption-qwen3-vl
+    spec:
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
+      containers:
+        - name: app
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              # Install dependencies
+              uv pip install transformers qwen-vl-utils accelerate Pillow av
+              uv pip install fastapi uvicorn python-multipart
+              uv pip install "setuptools<81"
+              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # ─── Clone serve script from GitHub (CAPTION branch w/ fix) ──────
+              git clone -b caption-endpoint https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
+
+              # ─── Model caching ───────────────────────────────────────────────
+              MODEL_ID="Qwen/Qwen3-VL-8B-Instruct"
+              MODEL_LOCAL="/tmp/Qwen3-VL-8B-Instruct"
+              MODEL_TAR="/var/mdl/qwen3_vl/Qwen3-VL-8B-Instruct.tar"
+
+              if [[ -f "$MODEL_TAR" ]]; then
+                echo "Copying model tar from S3 cache..."
+                cp "$MODEL_TAR" /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Extracting..."
+                tar xf /tmp/Qwen3-VL-8B-Instruct.tar -C /tmp/
+                rm -f /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Model extracted to $MODEL_LOCAL"
+              else
+                echo "Downloading model from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('${MODEL_ID}', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
+              "
+                echo "Creating tar archive for S3 cache..."
+                tar cf /tmp/Qwen3-VL-8B-Instruct.tar -C /tmp Qwen3-VL-8B-Instruct
+                mkdir -p "$(dirname $MODEL_TAR)"
+                cp /tmp/Qwen3-VL-8B-Instruct.tar "$MODEL_TAR"
+                rm -f /tmp/Qwen3-VL-8B-Instruct.tar
+                echo "Cached tar to S3!"
+              fi
+
+              echo "Model weights ready at $MODEL_LOCAL"
+
+              # ─── Launch TP-8 server ──────────────────────────────────────────
+              echo "Launching TP-8 serving (caption endpoint)..."
+              torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_deploy_fused.py
+          resources:
+            claims:
+              - name: s-lnc1-trn2
+            requests:
+              cpu: 44
+              memory: 440Gi
+            limits:
+              cpu: 44
+              memory: 440Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
+              value: "0"
+            - name: QWEN3_VL_MAX_NFRAMES
+              value: "4"
+            - name: QWEN3_VL_MAX_NEW_TOKENS
+              value: "256"
+            - name: MAX_SEQ_LEN
+              value: "4096"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 60
+            failureThreshold: 5
+            timeoutSeconds: 10
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
