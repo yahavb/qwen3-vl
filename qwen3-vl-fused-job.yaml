@@ -12,25 +12,61 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        # s-lnc1-trn3 = 1 device @ logicalNeuronCore:1 -> 8 NeuronCores -> TP-8 (1:1 swap from s-lnc1-trn2).
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command:
             - /bin/bash
             - "-exc"
             - |
               set -euxo pipefail
 
+              # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
+              # errors with "No virtual environment found". Target the SAME interpreter
+              # python3 uses (where torch-neuronx already lives) via --python.
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
+
               # Install dependencies
-              uv pip install transformers qwen-vl-utils accelerate Pillow av
-              uv pip install fastapi uvicorn python-multipart
-              uv pip install "setuptools<81"
-              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+              uv pip install --python "$UVPY" transformers qwen-vl-utils accelerate Pillow av
+              uv pip install --python "$UVPY" fastapi uvicorn python-multipart
+              uv pip install --python "$UVPY" "setuptools<81"
+              uv pip install --python "$UVPY" git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # SDK 2.31 DLC ships a python3 built WITHOUT the _lzma stdlib extension.
+              # torchvision eagerly imports datasets/utils.py -> `import lzma` AND then
+              # references `lzma.open` at module top level to build a decompressor dict,
+              # which crashes the whole `from transformers import AutoProcessor` chain at
+              # import time. torchvision.io (all we actually use) never opens .xz files,
+              # so replace lzma with a stub namespace that exposes .open (raises only if
+              # actually called) so module import succeeds.
+              "$UVPY" - <<'PY'
+              import importlib.util as u, pathlib
+              loc = u.find_spec('torchvision').submodule_search_locations[0]
+              p = pathlib.Path(loc) / 'datasets' / 'utils.py'
+              s = p.read_text()
+              if '_no_lzma' not in s:
+                  stub = (
+                      'try:\n'
+                      '    import lzma\n'
+                      'except ImportError:\n'
+                      '    import types as _t\n'
+                      '    def _no_lzma(*a, **k):\n'
+                      '        raise RuntimeError("lzma unavailable in this Python build")\n'
+                      '    lzma = _t.SimpleNamespace(open=_no_lzma, LZMAFile=_no_lzma)\n'
+                  )
+                  s = s.replace('import lzma\n', stub, 1)
+                  p.write_text(s)
+                  print('Patched torchvision datasets/utils.py: lzma replaced with stub')
+              else:
+                  print('torchvision datasets/utils.py already patched')
+              PY
 
               # ─── Clone serve script from GitHub ──────────────────────────────
               git clone -b fused-layer-compile https://github.com/yahavb/qwen3-vl.git /tmp/qwen3-vl
@@ -69,13 +105,15 @@ spec:
               torchrun --nproc_per_node=8 /tmp/qwen3-vl/serve_tp8_fused.py
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: neurons
             requests:
-              cpu: 44
-              memory: 440Gi
+              cpu: 11
+              memory: 120Gi
+              ephemeral-storage: 120Gi
             limits:
-              cpu: 44
-              memory: 440Gi
+              cpu: 11
+              memory: 120Gi
+              ephemeral-storage: 120Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
